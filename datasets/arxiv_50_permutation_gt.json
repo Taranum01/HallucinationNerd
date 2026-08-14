@@ -1,0 +1,158 @@
+[
+  {
+    "question_id": "ARXIV-2305.14314-18",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.08180-16",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.08180-7",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.09080-22",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.10703-5",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11332-16",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11408-7",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11624-21",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11624-11",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11650-1",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11746-3",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11772-21",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11816-21",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11830-9",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11830-4",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11843-17",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11879-30",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.11879-24",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.12008-21",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.12008-14",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.12036-20",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.12150-3",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.12253-20",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.12253-34",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.12290-21",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.12290-27",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.12308-19",
+    "status": "CORRECT"
+  },
+  {
+    "question_id": "ARXIV-2608.08180-16-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.09080-22-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.11332-16-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.11624-21-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.11650-1-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.11816-21-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.11830-4-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.11879-30-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.12008-21-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.12036-20-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.12253-34-SWAPPED",
+    "status": "SWAPPED"
+  },
+  {
+    "question_id": "ARXIV-2608.12290-27-SWAPPED",
+    "status": "SWAPPED"
+  }
+]
