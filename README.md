@@ -13,7 +13,11 @@ HallucinationNerd checks whether cited sources actually support the claims attri
 | ArXiv 40-paper (cross-topic swaps) | **97.3%** | 90.9% | 100% |
 | ArXiv same-field hard negatives | **92.6%** | 96.0% | 88.9% |
 
-Statistically significantly better than MiniCheck (p < 0.0001) and RAGAS (p = 0.0001) on identical test data.
+Outperforms all five competing systems evaluated on identical test data --- MiniCheck,
+RAGAS, HHEM 2.1, AlignScore, and SummaCConv --- by 20 to 64 accuracy points depending
+on the system and benchmark. All ten pairwise paired-permutation-test comparisons
+(5 systems x 2 benchmarks) are statistically significant at p < 0.01; most are p < 0.0001.
+See the paper for full per-system breakdowns.
 
 ## How It Works
 
