@@ -1,0 +1,193 @@
+"""
+PDF Claim Extractor — deterministic, regex-based extraction of cited claims from PDFs.
+
+Unlike decompose_claims (LLM-based, strips markers) or arxiv_extractor (requires arXiv IDs),
+this module simply extracts every sentence that contains a [N] citation marker, preserving
+the marker and its reference number. This is what feeds into the verification pipeline
+on the website.
+
+Produces the same format as decompose_claims: [{"claim_text": "...", "cited_refs": [N, M]}]
+"""
+
+import re
+from typing import List
+
+
+def extract_cited_claims_from_text(text: str, max_claims: int = 50) -> List[dict]:
+    """
+    Extract sentences/clauses containing citation markers [N] from document text.
+    Returns claims in the same format as decompose_claims.
+    
+    Works with all numbered citation formats: [1], [1,2], [1, 2, 3], [1-3]
+    """
+    # Find the main body (skip references section at the end)
+    ref_start = _find_references_start(text)
+    body = text[:ref_start] if ref_start else text
+
+    # Citation pattern: [1] or [1, 2] or [1,2,3] or [1-3]
+    cite_pattern = re.compile(r'\[(\d+(?:[\s,\-]+\d+)*)\]')
+
+    # Split into sentences (rough but effective for academic text)
+    # Handle abbreviations like "et al." "Fig." "eq." by not splitting on those
+    sentence_splitter = re.compile(r'(?<=[.!?])\s+(?=[A-Z\[])')
+    sentences = sentence_splitter.split(body)
+
+    claims = []
+    seen = set()  # Avoid duplicate claims
+
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent or len(sent) < 30:
+            continue
+
+        # Find all citation markers in this sentence
+        matches = cite_pattern.findall(sent)
+        if not matches:
+            continue
+
+        # Parse citation numbers
+        cited_refs = []
+        for match in matches:
+            # Handle ranges like "1-3" -> [1,2,3]
+            if '-' in match:
+                parts = match.split('-')
+                try:
+                    start, end = int(parts[0].strip()), int(parts[1].strip())
+                    cited_refs.extend(range(start, end + 1))
+                except ValueError:
+                    pass
+            else:
+                # Handle comma-separated: "1, 2, 3"
+                for num in match.split(','):
+                    num = num.strip()
+                    if num.isdigit():
+                        cited_refs.append(int(num))
+
+        if not cited_refs:
+            continue
+
+        # Clean the sentence (remove line breaks from PDF extraction)
+        clean = re.sub(r'\s+', ' ', sent).strip()
+        # Remove very long sentences (likely parsing errors)
+        if len(clean) > 500:
+            # Try to extract just the clause around the citation
+            clean = _extract_clause_around_citation(clean, cite_pattern)
+            if not clean:
+                continue
+
+        # Deduplicate
+        key = clean[:100]
+        if key in seen:
+            continue
+        seen.add(key)
+
+        claims.append({
+            "claim_text": clean,
+            "cited_refs": sorted(set(cited_refs)),
+        })
+
+        if len(claims) >= max_claims:
+            break
+
+    return claims
+
+
+def _extract_clause_around_citation(text: str, cite_pattern) -> str:
+    """Extract the clause containing the citation from a long sentence."""
+    match = cite_pattern.search(text)
+    if not match:
+        return ""
+
+    # Take ~200 chars around the citation
+    start = max(0, match.start() - 150)
+    end = min(len(text), match.end() + 50)
+
+    # Extend to sentence boundaries
+    while start > 0 and text[start] not in '.!?;':
+        start -= 1
+    if start > 0:
+        start += 2  # skip the period and space
+
+    clause = text[start:end].strip()
+    return clause if len(clause) > 30 else ""
+
+
+def _find_references_start(text: str) -> int:
+    """Find where the References/Bibliography section starts."""
+    patterns = [
+        r'\n\s*References?\s*\n',
+        r'\n\s*REFERENCES?\s*\n',
+        r'\n\s*Bibliography\s*\n',
+    ]
+    for p in patterns:
+        match = re.search(p, text)
+        if match:
+            return match.start()
+
+    # Fallback: find last occurrence of [1] at start of line (typical bib entry)
+    matches = list(re.finditer(r'\n\s*\[1\]\s+[A-Z]', text))
+    if matches:
+        return matches[-1].start()
+
+    return len(text)
+
+
+def split_multi_ref_claims(claims: List[dict], max_refs_per_claim: int = 3) -> List[dict]:
+    """
+    Split claims with many citations into smaller per-citation-group claims.
+    
+    A claim like "methods use attention [62,68], adapters [14,23], noise [26,27]"
+    becomes 3 claims, each with the clause relevant to its citation group.
+    
+    Claims with <= max_refs_per_claim citations are left unchanged.
+    """
+    import re
+    
+    result = []
+    cite_pattern = re.compile(r'\[(\d+(?:[\s,]+\d+)*)\]')
+    
+    for claim in claims:
+        refs = claim.get("cited_refs", [])
+        text = claim.get("claim_text", "")
+        
+        # If few refs, keep as-is
+        if len(refs) <= max_refs_per_claim:
+            result.append(claim)
+            continue
+        
+        # Find all citation positions in the text
+        matches = list(cite_pattern.finditer(text))
+        if len(matches) <= 1:
+            # Only one citation bracket (just many numbers in it) — keep as-is
+            result.append(claim)
+            continue
+        
+        # Split into per-bracket claims
+        for match in matches:
+            # Extract the clause before this citation bracket
+            pos = match.start()
+            # Walk backwards to find clause boundary
+            clause_start = max(0, pos - 200)
+            for i in range(pos - 1, max(0, pos - 200), -1):
+                if text[i] in ',;.':
+                    clause_start = i + 1
+                    break
+            
+            clause = text[clause_start:match.end()].strip()
+            if len(clause) < 20:
+                continue
+            
+            # Parse refs from this bracket
+            bracket_refs = []
+            for num in match.group(1).split(','):
+                num = num.strip()
+                if num.isdigit():
+                    bracket_refs.append(int(num))
+            
+            if bracket_refs:
+                result.append({
+                    "claim_text": clause,
+                    "cited_refs": bracket_refs,
+                })
+    
+    return result
