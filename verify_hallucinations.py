@@ -177,6 +177,15 @@ CONFIG = {
     "temperature": 0.0,  # deterministic for verification
     "max_retries": 3,
     "rate_limit_delay": 1.0,  # seconds between API calls
+    "strictness": "lenient",  # "lenient" (precision) | "strict" (recall)
+}
+
+# Strictness dial: which verdicts count as a detected hallucination.
+#   lenient (default) -> flag clear non-support only  (favors precision)
+#   strict            -> also flag partial support    (favors recall)
+STRICTNESS_FLAGS = {
+    "lenient": {"NOT_SUPPORTED", "CONTRADICTED", "FABRICATED"},
+    "strict": {"PARTIALLY_SUPPORTED", "NOT_SUPPORTED", "CONTRADICTED", "FABRICATED"},
 }
 
 
@@ -971,13 +980,18 @@ def compute_citation_metrics(results: list) -> dict:
     not_supported = by_verdict.get("NOT_SUPPORTED", 0)
     fabricated = by_verdict.get("FABRICATED", 0)
     unverifiable = by_verdict.get("UNVERIFIABLE", 0)
+    contradicted = by_verdict.get("CONTRADICTED", 0)
 
     verifiable = total - unverifiable
     citation_precision = supported / verifiable if verifiable > 0 else 0
-    hallucination_rate = (not_supported + fabricated) / verifiable if verifiable > 0 else 0
 
-    # Overall verdict: reliable / unreliable / mixed
-    contradicted = by_verdict.get("CONTRADICTED", 0)
+    # Strictness controls which verdicts count as a detected hallucination.
+    #   lenient (default): flag NOT_SUPPORTED + CONTRADICTED (favor precision)
+    #   strict:            also flag PARTIALLY_SUPPORTED (favor recall)
+    flagged_verdicts = STRICTNESS_FLAGS.get(CONFIG.get("strictness", "lenient"),
+                                            {"NOT_SUPPORTED", "CONTRADICTED", "FABRICATED"})
+    flagged = sum(by_verdict.get(v, 0) for v in flagged_verdicts)
+    hallucination_rate = flagged / verifiable if verifiable > 0 else 0
     if verifiable == 0:
         overall_verdict = "unverifiable"
     elif (not_supported + fabricated + contradicted) == 0:
@@ -1262,8 +1276,15 @@ def main():
              "sub-claims via an LLM pass. Use this for pre-atomized benchmark data (one claim, "
              "one citation per entry) — this is the mode used to produce the paper's reported numbers."
     )
+    parser.add_argument(
+        "--strictness", choices=["lenient", "strict"], default="lenient",
+        help="Strictness dial for flagging hallucinations. 'lenient' (default) flags only clear "
+             "non-support (NOT_SUPPORTED/CONTRADICTED) — favors precision. 'strict' also flags "
+             "PARTIALLY_SUPPORTED claims — favors recall."
+    )
 
     args = parser.parse_args()
+    CONFIG["strictness"] = args.strictness
 
     if args.model:
         CONFIG["model"] = args.model

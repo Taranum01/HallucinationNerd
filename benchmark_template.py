@@ -25,12 +25,12 @@ BENCHMARK = "cross_topic"  # or "hard_negatives"
 
 FILES = {
     "cross_topic": {
-        "input": "datasets/arxiv_50_permutation_input.json",
-        "gt": "datasets/arxiv_50_permutation_gt.json",
+        "input": "datasets/clean_benchmark_input.json",
+        "gt": "datasets/clean_benchmark_gt.json",
     },
     "hard_negatives": {
-        "input": "datasets/arxiv_hard_negatives_input.json",
-        "gt": "datasets/arxiv_hard_negatives_gt.json",
+        "input": "datasets/hardneg_benchmark_input.json",
+        "gt": "datasets/hardneg_benchmark_gt.json",
     },
 }[BENCHMARK]
 

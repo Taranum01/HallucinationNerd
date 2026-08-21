@@ -8,16 +8,20 @@ HallucinationNerd checks whether cited sources actually support the claims attri
 
 ## Key Results
 
+Evaluated on two benchmarks built from **randomly sampled arXiv papers**, where a subset of genuine citations are swapped with unrelated papers to create objective, annotation-free ground truth.
+
 | Benchmark | Accuracy | Precision | Recall |
 |-----------|----------|-----------|--------|
-| ArXiv 40-paper (cross-topic swaps) | **97.3%** | 90.9% | 100% |
-| ArXiv same-field hard negatives | **92.6%** | 96.0% | 88.9% |
+| Random arXiv — cross-category swaps (200 pairs) | **92.1%** | 86.1% | 100% |
+| Random arXiv — same-field hard negatives (187 pairs) | **90.2%** | 83.9% | 97.5% |
 
-Outperforms all five competing systems evaluated on identical test data --- MiniCheck,
-RAGAS, HHEM 2.1, AlignScore, and SummaCConv --- by 20 to 64 accuracy points depending
-on the system and benchmark. All ten pairwise paired-permutation-test comparisons
-(5 systems x 2 benchmarks) are statistically significant at p < 0.01; most are p < 0.0001.
-See the paper for full per-system breakdowns.
+Against the systems we ran on identical data — **MiniCheck** and **RAGAS** — HallucinationNerd is far ahead: both competitors sit near chance (52–56% accuracy) because they flag roughly half of the *genuine* citations, while HallucinationNerd keeps false positives low. Paired sign-flip permutation tests confirm the gap is significant (p < 0.0001 on both benchmarks). Additional NLI baselines (HHEM 2.1, AlignScore, SummaCConv) are evaluated in the paper.
+
+| System | Cross-category Acc | Same-field Acc |
+|---|---|---|
+| **HallucinationNerd** | **92.1%** | **90.2%** |
+| RAGAS | 54.5% | 55.6% |
+| MiniCheck | 52.5% | 51.9% |
 
 ## How It Works
 
@@ -52,6 +56,9 @@ python verify_hallucinations.py --input data.json --output-dir results/ --task c
 
 # Also search PubMed for uncited claims
 python verify_hallucinations.py --input data.json --output-dir results/ --task citation --search-backup
+
+# Adjust strictness: 'lenient' (default, precision-oriented) or 'strict' (recall-oriented)
+python verify_hallucinations.py --input data.json --output-dir results/ --task citation --strictness strict
 ```
 
 ## Input Format
@@ -99,23 +106,38 @@ The `arxiv_extractor.py` module auto-detects and extracts citations in:
 | `BACKUP_FOUND` | No citation provided; PubMed search found supporting evidence |
 | `NO_BACKUP_FOUND` | No citation provided; no supporting evidence found in PubMed |
 
-## Benchmarking Against Other Systems
+## Benchmarks & Reproduction
+
+The `datasets/` folder contains the two benchmarks used above, each as a self-contained
+`*_input.json` (claim + embedded source text) and `*_gt.json` (CORRECT / SWAPPED labels):
+
+- `clean_benchmark_*` — cross-category, 200 pairs (100 genuine + 100 swaps)
+- `hardneg_benchmark_*` — same-field hard negatives, 187 pairs (95 genuine + 92 swaps)
 
 ```bash
-# Run the benchmark evaluation script
+# Score any NLI/LLM system against a benchmark (edit the tool call inside)
 python benchmark_template.py
+
+# Reproduce HallucinationNerd verdicts
+python run_clean.py       # cross-category
+python run_hardneg.py     # same-field
+
+# Reproduce competitor baselines (needs: pip install minicheck ragas datasets)
+python run_competitors_clean.py both
+python run_competitors_hardneg.py both
 ```
 
-See `datasets/` for the test data used in our evaluations.
+The benchmark builders (`build_random_benchmark.py`, `rebuild_clean_benchmark.py`,
+`rebuild_hardneg_benchmark.py`, `topup_clean_to_200.py`) document exactly how the
+benchmarks were sampled and quality-filtered from arXiv. They download source PDFs at
+run time; the raw PDFs are not shipped here since their text is already embedded in the
+dataset JSONs.
 
 ## Statistical Validation
 
 ```bash
-# Permutation test (p-value)
-python statistical_tests/Diff2MeanSig.py
-
-# Bootstrap confidence interval
-python statistical_tests/Diff2MeanConf.py
+python statistical_tests/Diff2MeanSig.py    # permutation test (p-value)
+python statistical_tests/Diff2MeanConf.py   # bootstrap confidence interval
 ```
 
 ## Citation
