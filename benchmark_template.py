@@ -8,7 +8,7 @@ Use this as a template to evaluate other tools (e.g. HHEM, AlignScore, SummaCCon
 INPUT:
   - claims: list of text claims
   - docs: list of source documents
-  - ground_truth: is_swapped (True = hallucination, False = correct)
+  - ground_truth: is_incorrect (True = hallucination, False = correct)
 
 YOUR JOB:
   1. Install the new tool
@@ -21,22 +21,22 @@ Run: python benchmark_template.py
 
 import json
 
-BENCHMARK = "cross_topic"  # or "hard_negatives"
+BENCHMARK = "cross_category"  # or "same_field"
 
 FILES = {
-    "cross_topic": {
-        "input": "datasets/clean_benchmark_input.json",
-        "gt": "datasets/clean_benchmark_gt.json",
+    "cross_category": {
+        "input": "datasets/crosscat_input.json",
+        "gt": "datasets/crosscat_gt.json",
     },
-    "hard_negatives": {
-        "input": "datasets/hardneg_benchmark_input.json",
-        "gt": "datasets/hardneg_benchmark_gt.json",
+    "same_field": {
+        "input": "datasets/samefield_input.json",
+        "gt": "datasets/samefield_gt.json",
     },
 }[BENCHMARK]
 
 # --- STEP 1: Load the test data ---
 # Each entry is already a single (claim, document) pair -- one synopsis claim
-# plus its single cited article, with ground truth status CORRECT/SWAPPED.
+# plus its single cited article, with ground truth status CORRECT/INCORRECT.
 with open(FILES["input"]) as f:
     entries = json.load(f)
 with open(FILES["gt"]) as f:
@@ -53,12 +53,12 @@ for e in entries:
         "question_id": qid,
         "claim": e["synopsis"],
         "document": e["retrieved_articles"][0]["content"][:3000],  # truncate for most tools
-        "is_swapped": (status == "SWAPPED"),  # True = should be flagged
+        "is_incorrect": (status == "INCORRECT"),  # True = should be flagged
     })
 
 print(f"Loaded {len(pairs)} test pairs from '{BENCHMARK}'")
-print(f"  Swapped (should detect): {sum(1 for p in pairs if p['is_swapped'])}")
-print(f"  Correct (should not flag): {sum(1 for p in pairs if not p['is_swapped'])}")
+print(f"  Incorrect (should detect): {sum(1 for p in pairs if p['is_incorrect'])}")
+print(f"  Correct (should not flag): {sum(1 for p in pairs if not p['is_incorrect'])}")
 
 # --- STEP 3: Run YOUR tool here ---
 # Replace this section with the new tool's code.
@@ -88,13 +88,13 @@ for pair in pairs:
 # --- STEP 4: Calculate metrics ---
 tp = tn = fp = fn = 0
 for i, pair in enumerate(pairs):
-    is_swapped = pair["is_swapped"]
+    is_incorrect = pair["is_incorrect"]
     tool_says_hallucination = tool_predictions[i]
 
-    if is_swapped and tool_says_hallucination: tp += 1
-    elif is_swapped and not tool_says_hallucination: fn += 1
-    elif not is_swapped and not tool_says_hallucination: tn += 1
-    elif not is_swapped and tool_says_hallucination: fp += 1
+    if is_incorrect and tool_says_hallucination: tp += 1
+    elif is_incorrect and not tool_says_hallucination: fn += 1
+    elif not is_incorrect and not tool_says_hallucination: tn += 1
+    elif not is_incorrect and tool_says_hallucination: fp += 1
 
 total = tp + tn + fp + fn
 accuracy = (tp + tn) / total if total else 0

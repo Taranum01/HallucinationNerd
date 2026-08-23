@@ -1,9 +1,9 @@
 import json, os
 from dataclasses import asdict
 from verify_hallucinations import verify_citations_for_question
-INPUT="datasets/clean_benchmark_input.json"
-OUT="results/CLEAN200/citation_verification.jsonl"
-os.makedirs("results/CLEAN200", exist_ok=True)
+INPUT="arxiv_test/random200/v100_all_input.json"
+OUT="results/V100/citation_verification.jsonl"
+os.makedirs("results/V100", exist_ok=True)
 entries=json.load(open(INPUT))
 done=set()
 if os.path.exists(OUT):

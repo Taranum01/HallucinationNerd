@@ -130,9 +130,11 @@ function renderResults(data) {
     const partialRefs = new Set();
     const notSupportedRefs = new Set();
     const inaccessibleRefs = new Set();
+    let noCitationCount = 0;
 
     data.claims.forEach(c => {
         const refs = c.cited_refs || [];
+        if (refs.length === 0) { noCitationCount++; return; }
         refs.forEach(r => {
             if (c.citation_exists === true) {
                 existingRefs.add(r);
@@ -165,6 +167,11 @@ function renderResults(data) {
     showCat('catPartial', partialRefs);
     showCat('catNotSupported', notSupportedRefs);
     showCat('catInaccessible', inaccessibleRefs);
+    if (noCitationCount > 0) {
+        document.getElementById('catNoCitation').classList.remove('hidden');
+        document.getElementById('catNoCitationRefs').textContent =
+            ` ${noCitationCount} claim${noCitationCount === 1 ? '' : 's'} with no inline citation`;
+    }
 
     // Show detailed claims header
     document.getElementById('detailsHeader').style.display = 'block';
@@ -175,7 +182,9 @@ function renderResults(data) {
         card.className = `p-4 rounded-lg fade-in ${getVerdictClass(claim.verdict)}`;
         card.style.animationDelay = `${i * 0.05}s`;
 
-        const verdictBadge = getVerdictBadge(claim.verdict);
+        const verdictBadge = (!claim.cited_refs || claim.cited_refs.length === 0)
+            ? { label: '— No Citation Provided', class: 'bg-purple-100 text-purple-700' }
+            : getVerdictBadge(claim.verdict);
         const confidence = claim.confidence ? `${Math.round(claim.confidence * 100)}%` : '';
 
         card.innerHTML = `
