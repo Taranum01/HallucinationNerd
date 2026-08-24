@@ -403,13 +403,19 @@ def extract_cited_refs(text: str) -> list:
     return refs
 
 
-def _find_relevant_spans(claim_text: str, content: str, max_chars: int = 4000, window: int = 500) -> str:
+def _find_relevant_spans(claim_text: str, content: str, max_chars: int = 4000, window: int = 1000, top_chunks: int = 12, anchor_chars: int = 500) -> str:
     """
     Find the most relevant spans in a long document for a given claim.
-    Uses keyword overlap to locate the best chunks, then returns them concatenated.
-    
-    This implements the HLD's "reference matching" — finding the most relevant
-    spans in the reference for each claim.
+    Uses keyword overlap to locate the best chunks, then returns them
+    concatenated, with the first and last `anchor_chars` of the document
+    always included as anchors so the LLM has context for intro/conclusion.
+
+    C7 fix: finer granularity (window=1000, step=200) and more chunks
+    (top 12 vs 8). The previous coarser window missed multi-clause claims
+    whose key terms were spread across the document.
+
+    This implements the HLD's "reference matching" — finding the most
+    relevant spans in the reference for each claim.
     """
     # Extract key terms from the claim
     stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'been', 'be', 'have', 'has',
@@ -417,51 +423,65 @@ def _find_relevant_spans(claim_text: str, content: str, max_chars: int = 4000, w
                   'shall', 'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in', 'for', 'on',
                   'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after',
                   'that', 'this', 'these', 'those', 'it', 'its', 'and', 'or', 'but', 'not', 'no'}
-    
-    claim_words = set(w.lower().strip('.,;:()[]') for w in claim_text.split() 
+
+    claim_words = set(w.lower().strip('.,;:()[]') for w in claim_text.split()
                      if len(w) > 3 and w.lower() not in stop_words)
-    
+
     if not claim_words:
         return content[:max_chars]
-    
+
+    # For very short content (shorter than the window), no chunking is
+    # needed; return as-is.
+    if len(content) <= window:
+        return content[:max_chars]
+
+    # Always include the first and last `anchor_chars` of the document so
+    # the LLM has intro/conclusion context even when key terms live in
+    # the middle.
+    anchors = []
+    head = content[:anchor_chars]
+    tail = content[-anchor_chars:] if len(content) > anchor_chars else ""
+    if head:
+        anchors.append((0, head))
+    if tail and tail != head:
+        anchors.append((len(content) - anchor_chars, tail))
+
     # Split content into overlapping windows and score each by keyword overlap
     chunks = []
-    step = window // 2  # 50% overlap
+    step = max(50, window // 5)  # 5 windows per window-width for finer granularity
     for i in range(0, len(content) - window, step):
         chunk = content[i:i + window]
         chunk_words = set(w.lower().strip('.,;:()[]') for w in chunk.split())
         score = len(claim_words & chunk_words)
         chunks.append((score, i, chunk))
-    
-    if not chunks:
-        return content[:max_chars]
-    
+
     # Sort by relevance score, take top chunks
     chunks.sort(key=lambda x: -x[0])
-    
-    # Collect top chunks until we hit max_chars, maintaining document order
-    selected = sorted(chunks[:8], key=lambda x: x[1])  # Sort by position
+
+    # Combine: top chunks (deduped against anchors by position) + anchors.
+    # Then sort by position to maintain document order.
+    selected_positions = set()
+    result_parts = []  # list of (position, text)
+
+    for score, pos, chunk in chunks[:top_chunks]:
+        if score >= 2 and pos not in selected_positions:
+            result_parts.append((pos, chunk))
+            selected_positions.add(pos)
+
+    for pos, anchor in anchors:
+        if pos not in selected_positions:
+            result_parts.append((pos, anchor))
+            selected_positions.add(pos)
+
+    result_parts.sort(key=lambda x: x[0])
     result = ""
-    for score, pos, chunk in selected:
-        if score >= 2:  # At least 2 keyword matches
-            if len(result) + len(chunk) + 10 > max_chars:
-                break
-            if result:
-                result += "\n...\n"
-            result += chunk
-    
-    # If nothing found with good scores, use beginning + any keyword-containing sections
-    if not result:
-        result = content[:2000]
-        # Also add any paragraph containing claim keywords
-        paragraphs = content.split('\n\n')
-        for para in paragraphs:
-            para_words = set(w.lower() for w in para.split())
-            if len(claim_words & para_words) >= 2 and para not in result:
-                if len(result) + len(para) < max_chars:
-                    result += f"\n...\n{para}"
-    
-    return result[:max_chars]
+    for pos, chunk in result_parts:
+        if len(result) + len(chunk) + 10 > max_chars:
+            break
+        if result:
+            result += "\n...\n"
+        result += chunk
+    return result
 
 
 def _search_backup_reference(claim_text: str, question: str, question_id: str, claim_idx: int, search_fn) -> 'ClaimVerification':
@@ -758,7 +778,7 @@ def verify_single_claim(
     evidence_ref = str(cited_refs[0]) if cited_refs else ""
     span_start = -1
     span_end = -1
-    
+
     if evidence_quote and cited_refs:
         # Try to locate the quote in the source article
         ref_idx = cited_refs[0] - 1
@@ -777,6 +797,29 @@ def verify_single_claim(
                     if pos >= 0:
                         span_start = pos
                         span_end = pos + len(evidence_quote)
+                if pos < 0:
+                    # Final fallback: normalized whitespace match.
+                    # The LLM may have collapsed/different whitespace than
+                    # the source (e.g. the LLM returned "Hello world" and
+                    # the source has "Hello  world"). Normalize both and
+                    # search again.
+                    import re as _re
+                    def _norm_ws(s):
+                        return _re.sub(r"\s+", " ", s).strip()
+                    src_norm = _norm_ws(source_content)
+                    quote_norm = _norm_ws(evidence_quote[:50])
+                    if quote_norm:
+                        pos_norm = src_norm.find(quote_norm)
+                        if pos_norm >= 0:
+                            # Map back to the original source by finding the
+                            # normalized position in a pre-normalized mapping
+                            # of offsets. Approximate: search for the
+                            # first 10 chars of the quote in the original.
+                            head = quote_norm[:10]
+                            pos = source_content.find(head)
+                            if pos >= 0:
+                                span_start = pos
+                                span_end = pos + len(evidence_quote)
 
     return ClaimVerification(
         question_id=question_id,
@@ -983,7 +1026,9 @@ def verify_claim_per_ref(
     evidence_quote = best_payload.get("evidence_quote", "")
     evidence_ref = str(chosen_ref) if chosen_ref is not None else ""
 
-    # Compute span offset in the chosen source (best-effort)
+    # Compute span offset in the chosen source (best-effort). C10 fix:
+    # fallback chain is now (1) exact prefix match, (2) start-phrase match,
+    # (3) normalized-whitespace match.
     span_start = -1
     span_end = -1
     if evidence_quote and chosen_ref is not None and 0 <= (chosen_ref - 1) < len(articles):
@@ -1001,6 +1046,21 @@ def verify_claim_per_ref(
                     if pos >= 0:
                         span_start = pos
                         span_end = pos + len(evidence_quote)
+                if pos < 0:
+                    # Normalized-whitespace fallback
+                    import re as _re
+                    def _norm_ws(s):
+                        return _re.sub(r"\s+", " ", s).strip()
+                    src_norm = _norm_ws(source_content)
+                    quote_norm = _norm_ws(evidence_quote[:50])
+                    if quote_norm:
+                        pos_norm = src_norm.find(quote_norm)
+                        if pos_norm >= 0:
+                            head = quote_norm[:10]
+                            pos = source_content.find(head)
+                            if pos >= 0:
+                                span_start = pos
+                                span_end = pos + len(evidence_quote)
 
     result = ClaimVerification(
         question_id=question_id,

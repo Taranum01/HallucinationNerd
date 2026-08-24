@@ -476,12 +476,38 @@ def _search_semantic_scholar(query: str) -> Optional[str]:
     return None
 
 
+def _make_cache_key(ref_info: dict, ref_key: str) -> str:
+    """Stable cache key for a parsed reference.
+
+    The previous key (first 100 chars of `raw` text) caused collisions
+    whenever two references had the same opening — common for repeated
+    author names, long titles getting truncated the same way, etc.
+
+    New key: prefer canonical identifiers (arxiv_id > doi > pmid > title).
+    Falls back to a hash of (title + arxiv_id + doi) for the long tail.
+    """
+    arxiv = (ref_info.get("arxiv_id") or "").strip().lower()
+    if arxiv:
+        return f"arxiv:{arxiv}"
+    doi = (ref_info.get("doi") or "").strip().lower()
+    if doi:
+        return f"doi:{doi}"
+    pmid = (ref_info.get("pmid") or "").strip()
+    if pmid:
+        return f"pmid:{pmid}"
+    title = (ref_info.get("title") or ref_info.get("raw") or ref_key).strip().lower()
+    if title:
+        import hashlib
+        return "title:" + hashlib.sha256(title.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"raw:{ref_key}"
+
+
 def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
     """
     Main entry point: given full document text and a list of citation markers
     (e.g., ["1", "2"]), resolve each to actual content.
     Uses parallel fetching for speed (5 concurrent downloads).
-    
+
     Returns: {"1": "content text...", "2": None, ...}
     """
     # Parse references section
@@ -492,8 +518,8 @@ def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
     to_fetch = []
     for ref_key in cited_refs:
         ref_key_str = str(ref_key)
-        # Check cache
-        cache_key = refs.get(ref_key_str, {}).get("raw", ref_key_str)[:100]
+        ref_info = refs.get(ref_key_str, {})
+        cache_key = _make_cache_key(ref_info, ref_key_str)
         if cache_key in _source_cache:
             results[ref_key_str] = _source_cache[cache_key]
         elif ref_key_str in refs:
