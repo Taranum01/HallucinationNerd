@@ -934,38 +934,64 @@ def verify_claim_per_ref(
             relevant = _find_relevant_spans(claim_text, content)
         source_block = f"[{ref_num}] {title}\n{relevant}"
 
+        # H1: NLI pre-filter (optional, default off). If enabled and the
+        # NLI model is confident (>= SHORT_CIRCUIT_*_THRESHOLD), skip the
+        # LLM call for this ref entirely. Saves cost and latency on
+        # high-confidence SUPPORTED/NOT_SUPPORTED verdicts.
+        nli_short_circuited = False
+        try:
+            import hve_nli
+            short = hve_nli.maybe_short_circuit(claim_text, source_block)
+            if short is not None:
+                verdict_label, conf, _eq = short
+                ref_verdict = verdict_label
+                ref_payload = {
+                    "verdict": verdict_label,
+                    "confidence": conf,
+                    "evidence_quote": "",
+                    "evidence_start_phrase": "",
+                    "reasoning": f"short-circuited by NLI pre-filter (confidence {conf:.2f})",
+                }
+                nli_short_circuited = True
+        except ImportError:
+            pass  # hve_nli not on path; skip
+
         user_prompt = (
             f"ORIGINAL QUESTION: {question}\n\n"
             f"CLAIM ATTRIBUTED TO YOU: {claim_text}\n\n"
             f"YOUR CONTENT:\n{source_block}"
-        )
+        ) if not nli_short_circuited else ""
 
-        # n_votes: majority over the votes for this single ref
-        passes = []
-        for _ in range(max(1, n_votes)):
-            raw = llm_call(
-                CITATION_VERIFICATION_PROMPT,
-                user_prompt,
-                response_format={"type": "json_object"},
-            )
-            try:
-                passes.append(json.loads(raw))
-            except json.JSONDecodeError:
-                passes.append({
-                    "verdict": "UNVERIFIABLE",
-                    "confidence": 0.0,
-                    "evidence_quote": "",
-                    "evidence_start_phrase": "",
-                    "reasoning": "Failed to parse verification response",
-                })
-
-        if n_votes > 1:
-            vote_counts = Counter(p.get("verdict", "UNVERIFIABLE") for p in passes)
-            ref_verdict = vote_counts.most_common(1)[0][0]
-            ref_payload = next(p for p, v in zip(passes, [pp.get("verdict", "UNVERIFIABLE") for pp in passes]) if v == ref_verdict)
+        if nli_short_circuited:
+            # Skip LLM call entirely; ref_verdict and ref_payload already set
+            passes = [ref_payload]
         else:
-            ref_verdict = passes[0].get("verdict", "UNVERIFIABLE")
-            ref_payload = passes[0]
+            # n_votes: majority over the votes for this single ref
+            passes = []
+            for _ in range(max(1, n_votes)):
+                raw = llm_call(
+                    CITATION_VERIFICATION_PROMPT,
+                    user_prompt,
+                    response_format={"type": "json_object"},
+                )
+                try:
+                    passes.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    passes.append({
+                        "verdict": "UNVERIFIABLE",
+                        "confidence": 0.0,
+                        "evidence_quote": "",
+                        "evidence_start_phrase": "",
+                        "reasoning": "Failed to parse verification response",
+                    })
+
+            if n_votes > 1:
+                vote_counts = Counter(p.get("verdict", "UNVERIFIABLE") for p in passes)
+                ref_verdict = vote_counts.most_common(1)[0][0]
+                ref_payload = next(p for p, v in zip(passes, [pp.get("verdict", "UNVERIFIABLE") for pp in passes]) if v == ref_verdict)
+            else:
+                ref_verdict = passes[0].get("verdict", "UNVERIFIABLE")
+                ref_payload = passes[0]
 
         ref_confidence = float(ref_payload.get("confidence", 0.0))
         per_ref_verdicts.append({
