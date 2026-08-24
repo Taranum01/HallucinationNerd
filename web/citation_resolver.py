@@ -25,8 +25,12 @@ _MIN_REQUEST_INTERVAL = 0.3  # Faster with API key (100/sec allowed)
 # Semantic Scholar API key (free, 100 req/sec vs 1 req/sec without)
 _S2_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
 
-# Simple in-memory cache for resolved sources
-_source_cache = {}
+# Simple in-memory cache for resolved sources. Entries expire after
+# `_CACHE_TTL_SECONDS` so stale arXiv versions and rate-limited Unpaywall
+# responses don't stick forever.
+import time as _time
+_source_cache: dict = {}  # cache_key -> (timestamp, content)
+_CACHE_TTL_SECONDS = 3600  # 1 hour default; override with HVE_CACHE_TTL
 
 
 def _rate_limit():
@@ -516,12 +520,20 @@ def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
     # Check cache first, build list of refs that need fetching
     results = {}
     to_fetch = []
+    ttl = int(os.getenv("HVE_CACHE_TTL", str(_CACHE_TTL_SECONDS)))
+    now = _time.time()
+    # Garbage-collect expired entries
+    for k in [k for k, v in _source_cache.items() if now - v[0] > ttl]:
+        _source_cache.pop(k, None)
+
     for ref_key in cited_refs:
         ref_key_str = str(ref_key)
         ref_info = refs.get(ref_key_str, {})
         cache_key = _make_cache_key(ref_info, ref_key_str)
-        if cache_key in _source_cache:
-            results[ref_key_str] = _source_cache[cache_key]
+        cached = _source_cache.get(cache_key)
+        if cached is not None:
+            _, content = cached
+            results[ref_key_str] = content
         elif ref_key_str in refs:
             to_fetch.append((ref_key_str, refs[ref_key_str], cache_key))
         else:
@@ -540,8 +552,8 @@ def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
                 try:
                     content = future.result()
                     results[ref_key_str] = content
-                    # Cache it
-                    _source_cache[cache_key] = content
+                    # Cache it with timestamp for TTL
+                    _source_cache[cache_key] = (now, content)
                 except Exception:
                     results[ref_key_str] = None
 
