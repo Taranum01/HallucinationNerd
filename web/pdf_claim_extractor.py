@@ -27,10 +27,32 @@ def extract_cited_claims_from_text(text: str, max_claims: int = 200) -> List[dic
     # Citation pattern: [1] or [1, 2] or [1,2,3] or [1-3]
     cite_pattern = re.compile(r'\[(\d+(?:[\s,\-]+\d+)*)\]')
 
-    # Split into sentences (rough but effective for academic text)
-    # Handle abbreviations like "et al." "Fig." "eq." by not splitting on those
+    # H2 fix: protect common academic abbreviations from being treated as
+    # sentence boundaries. The naive `(?<=[.!?])\s+(?=[A-Z\[])` would
+    # incorrectly split at "et al.", "Fig.", "i.e.", "e.g.", etc.
+    _ABBREVIATIONS = (
+        "et al", "Fig", "Eq", "i.e", "e.g", "cf", "vs", "approx",
+        "Dr", "Mr", "Mrs", "Ms", "Prof", "St", "No", "Inc", "Ltd",
+        "Co", "Corp", "al", "pp", "Vol",
+    )
+    # Use a placeholder that contains a non-period char so the splitter
+    # doesn't see "<placeholder>." as a sentence boundary either.
+    _ABBREV_PLACEHOLDER = "\x00ABBR\x00"
+
+    body_protected = body
+    for abbr in _ABBREVIATIONS:
+        # Replace `<abbr>.` with `<abbr><placeholder>` (the period is
+        # removed, not kept), so the splitter skips this as a boundary.
+        body_protected = re.sub(
+            r"(\b" + re.escape(abbr) + r")\.",
+            r"\1" + _ABBREV_PLACEHOLDER,
+            body_protected,
+        )
+
     sentence_splitter = re.compile(r'(?<=[.!?])\s+(?=[A-Z\[])')
-    sentences = sentence_splitter.split(body)
+    sentences = sentence_splitter.split(body_protected)
+    # Restore the period for each abbreviation occurrence
+    sentences = [s.replace(_ABBREV_PLACEHOLDER, ".") for s in sentences]
 
     claims = []
     seen = set()  # Avoid duplicate claims

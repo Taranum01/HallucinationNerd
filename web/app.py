@@ -331,6 +331,11 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
 
     verifiable = total - unverifiable
     reliability_pct = (supported + partial) / verifiable * 100 if verifiable > 0 else 0
+    # H5 fix: also expose the supported-only precision. PARTIALLY is
+    # ambiguous (the claim is only partially supported by the cited source),
+    # so reporting (supported + partial) as "reliability" overstates
+    # confidence. The UI should show both.
+    precision_pct = supported / verifiable * 100 if verifiable > 0 else 0
 
     return {
         "filename": filename,
@@ -341,7 +346,8 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
             "not_supported": not_supported,
             "contradicted": contradicted,
             "unverifiable": unverifiable,
-            "reliability_percent": round(reliability_pct, 1),
+            "reliability_percent": round(reliability_pct, 1),  # includes PARTIALLY
+            "precision_percent": round(precision_pct, 1),  # SUPPORTED only
         },
         "claims": results,
     }
@@ -397,6 +403,7 @@ def _verify_structured_input(data: list) -> dict:
 
     verifiable = total - unverifiable
     reliability_pct = (supported + partial) / verifiable * 100 if verifiable > 0 else 0
+    precision_pct = supported / verifiable * 100 if verifiable > 0 else 0
 
     return {
         "filename": "structured_input.json",
@@ -407,7 +414,8 @@ def _verify_structured_input(data: list) -> dict:
             "not_supported": not_supported,
             "contradicted": contradicted,
             "unverifiable": unverifiable,
-            "reliability_percent": round(reliability_pct, 1),
+            "reliability_percent": round(reliability_pct, 1),  # includes PARTIALLY
+            "precision_percent": round(precision_pct, 1),  # SUPPORTED only
         },
         "claims": all_results,
     }
