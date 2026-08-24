@@ -47,8 +47,14 @@ async def verify_document(
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="Server misconfigured: no API key")
 
-    # Read uploaded file
+    # L24: enforce a max upload size to prevent abuse. Default 25 MB.
+    max_bytes = int(os.getenv("HVE_MAX_UPLOAD_BYTES", "26214400"))
     content_bytes = await file.read()
+    if len(content_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(content_bytes)} bytes; max {max_bytes})",
+        )
     filename = file.filename or "uploaded_file"
     suffix = Path(filename).suffix.lower()
 

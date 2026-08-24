@@ -258,7 +258,7 @@ def _fetch_doi(doi: str) -> Optional[str]:
     # Try Unpaywall first (finds free/open-access versions)
     _rate_limit()
     try:
-        unpaywall_url = f"https://api.unpaywall.org/v2/{doi}?email=hallucinationnerd@example.com"
+        unpaywall_url = f"https://api.unpaywall.org/v2/{doi}?email={os.getenv('UNPAYWALL_EMAIL', 'hallucinationnerd@example.com')}"
         resp = requests.get(unpaywall_url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()

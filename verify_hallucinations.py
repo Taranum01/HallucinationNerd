@@ -240,6 +240,7 @@ class EvalVerification:
     verdict: str
     severity: str
     reasoning: str
+    confidence: float = 0.0
 
 
 # ─── LLM Client ─────────────────────────────────────────────────────────────
@@ -611,14 +612,14 @@ def search_pubmed(query: str, max_results: int = 3) -> list:
     """
     Search PubMed for articles matching a query.
     Returns list of {"title": str, "content": str, "url": str}.
-    
+
     This is the default search_fn for backup reference finding.
     """
     import requests
-    
+
     # PubMed E-utilities search
     base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-    
+
     # Step 1: Search for article IDs
     search_url = f"{base_url}/esearch.fcgi"
     params = {
@@ -627,17 +628,17 @@ def search_pubmed(query: str, max_results: int = 3) -> list:
         "retmax": max_results,
         "retmode": "json",
     }
-    
+
     try:
         resp = requests.get(search_url, params=params, timeout=15)
         data = resp.json()
         ids = data.get("esearchresult", {}).get("idlist", [])
-    except:
+    except Exception:
         return []
-    
+
     if not ids:
         return []
-    
+
     # Step 2: Fetch abstracts for found articles
     fetch_url = f"{base_url}/efetch.fcgi"
     params = {
@@ -645,36 +646,52 @@ def search_pubmed(query: str, max_results: int = 3) -> list:
         "id": ",".join(ids),
         "retmode": "xml",
     }
-    
+
     try:
         resp = requests.get(fetch_url, params=params, timeout=15)
-        # Simple XML parsing for title + abstract
+        # M9 fix: use ElementTree to handle nested tags and CDATA
+        # correctly. The previous regex approach broke on PubMed XML
+        # where abstract sections can be split or have inner markup.
         import re
+        import xml.etree.ElementTree as ET
         results = []
-        articles = resp.text.split("<PubmedArticle>")[1:]
-        
-        for article_xml in articles[:max_results]:
-            title_match = re.search(r"<ArticleTitle>(.*?)</ArticleTitle>", article_xml, re.DOTALL)
-            abstract_match = re.search(r"<AbstractText.*?>(.*?)</AbstractText>", article_xml, re.DOTALL)
-            pmid_match = re.search(r"<PMID.*?>(.*?)</PMID>", article_xml)
-            
-            title = title_match.group(1).strip() if title_match else ""
-            abstract = abstract_match.group(1).strip() if abstract_match else ""
-            pmid = pmid_match.group(1).strip() if pmid_match else ""
-            
-            # Clean HTML tags
-            title = re.sub(r"<.*?>", "", title)
-            abstract = re.sub(r"<.*?>", "", abstract)
-            
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError:
+            # Fall back to a coarse split if the document is malformed
+            articles = resp.text.split("<PubmedArticle>")[1:]
+            for article_xml in articles[:max_results]:
+                title_m = re.search(r"<ArticleTitle>(.*?)</ArticleTitle>", article_xml, re.DOTALL)
+                abstract_m = re.search(r"<AbstractText.*?>(.*?)</AbstractText>", article_xml, re.DOTALL)
+                pmid_m = re.search(r"<PMID.*?>(.*?)</PMID>", article_xml)
+                title = re.sub(r"<.*?>", "", title_m.group(1).strip()) if title_m else ""
+                abstract = re.sub(r"<.*?>", "", abstract_m.group(1).strip()) if abstract_m else ""
+                pmid = pmid_m.group(1).strip() if pmid_m else ""
+                if title and abstract:
+                    results.append({
+                        "title": title,
+                        "content": abstract,
+                        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                    })
+            return results
+
+        for article in root.findall(".//PubmedArticle"):
+            title_el = article.find(".//ArticleTitle")
+            abstract_els = article.findall(".//AbstractText")
+            pmid_el = article.find(".//PMID")
+            title = "".join(title_el.itertext()).strip() if title_el is not None else ""
+            abstract = " ".join("".join(e.itertext()).strip() for e in abstract_els).strip()
+            pmid = "".join(pmid_el.itertext()).strip() if pmid_el is not None else ""
             if title and abstract:
                 results.append({
                     "title": title,
                     "content": abstract,
                     "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
                 })
-        
+            if len(results) >= max_results:
+                break
         return results
-    except:
+    except Exception:
         return []
 
 
@@ -1284,6 +1301,7 @@ def verify_article_evaluation(
             generated_value=str(value)[:500],
             verdict=result.get("verdict", "UNVERIFIABLE"),
             severity=result.get("severity", "MINOR"),
+            confidence=_clamp_confidence(result.get("confidence"), default=0.0),
             reasoning=result.get("reasoning", ""),
         ))
 
@@ -1314,6 +1332,7 @@ def verify_article_evaluation(
             generated_value=summary[:500],
             verdict=result.get("verdict", "UNVERIFIABLE"),
             severity=result.get("severity", "MINOR"),
+            confidence=_clamp_confidence(result.get("confidence"), default=0.0),
             reasoning=result.get("reasoning", ""),
         ))
 
@@ -1487,6 +1506,8 @@ def write_summary_report(citation_metrics: dict, eval_metrics: dict, output_dir:
     report = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model_used": CONFIG["model"],
+        "strictness": CONFIG.get("strictness", "lenient"),
+        "rate_limit_delay": CONFIG.get("rate_limit_delay", 1.0),
         "citation_verification": citation_metrics,
         "evaluation_verification": eval_metrics,
     }
