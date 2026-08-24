@@ -3,3 +3,17 @@ __pycache__/
 *.pyc
 .DS_Store
 results/
+Diff2Mean.vals
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+web/__pycache__/
+verification_runs/
+*.log
+.DS_Store
+

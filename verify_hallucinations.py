@@ -768,15 +768,230 @@ def verify_single_claim(
     )
 
 
-def verify_citations_for_question(entry: dict, search_backup: bool = False, n_votes: int = 1, single_claim: bool = False) -> list:
+# Aggregation order for per-ref verdicts. Higher index = stronger claim support.
+# "Best ref wins": if any ref says SUPPORTED, the claim is at least partly supported.
+_PER_REF_AGGREGATION_ORDER = [
+    "UNVERIFIABLE",
+    "CONTRADICTED",
+    "NOT_SUPPORTED",
+    "PARTIALLY_SUPPORTED",
+    "SUPPORTED",
+]
+
+
+def verify_claim_per_ref(
+    claim: dict, articles: list, question: str, question_id: str, claim_idx: int,
+    search_backup: bool = False, search_fn=None, n_votes: int = 1
+) -> ClaimVerification:
+    """Verify one claim against each cited ref independently, then aggregate.
+
+    The root cause of the 55-62% website drop was a single-LLM-call design
+    that concatenated all cited sources into one source block, then asked
+    the LLM to verify the whole sentence at once. For a 5-ref claim
+    (e.g. "transformers [62,68] use self-attention; adapters [14,23] are
+    parameter-efficient; noise [26,27] is a regularizer"), the LLM would
+    see only one source's content covering ~1/5 of the sentence and
+    return PARTIALLY_SUPPORTED.
+
+    This function issues one LLM call per ref, then picks the strongest
+    verdict (any SUPPORTED ref promotes the claim; otherwise any
+    PARTIALLY; etc.). The returned ClaimVerification also has a
+    `per_ref_verdicts` attribute attached (list of dicts with ref_num,
+    verdict, confidence, evidence_quote, error) for callers that want
+    the per-ref breakdown.
+
+    Cost: N LLM calls per multi-ref claim vs 1 in the old path. Worth it;
+    this is the headline number the website reports.
+    """
+    cited_refs = claim.get("cited_refs", [])
+    claim_text = claim.get("claim_text", "")
+
+    if not cited_refs:
+        # No citations: fall through to the same uncited-claim path as
+        # verify_single_claim (search_backup or UNVERIFIABLE).
+        if search_backup and search_fn:
+            return _search_backup_reference(claim_text, question, question_id, claim_idx, search_fn)
+        return ClaimVerification(
+            question_id=question_id,
+            claim_id=f"{question_id}-C{claim_idx}",
+            claim_text=claim_text,
+            cited_refs=[],
+            verdict="UNVERIFIABLE",
+            confidence=0.5,
+            evidence_quote="",
+            evidence_reference="",
+            evidence_span_start=-1,
+            evidence_span_end=-1,
+            reasoning="No citation provided for this claim",
+        )
+
+    per_ref_verdicts = []
+    best_verdict = None
+    best_rank = -1
+    best_payload = None  # confidence/evidence/reasoning from the winning ref
+    chosen_ref = None
+
+    for ref_num in cited_refs:
+        idx = ref_num - 1
+        if not (0 <= idx < len(articles)):
+            per_ref_verdicts.append({
+                "ref_num": ref_num,
+                "verdict": "UNVERIFIABLE",
+                "confidence": 0.0,
+                "evidence_quote": "",
+                "reasoning": f"ref [{ref_num}] not in retrieved set",
+                "error": "missing",
+            })
+            continue
+
+        art = articles[idx]
+        content = art.get("content") or art.get("abstract") or art.get("summary") or ""
+        title = art.get("title", f"Article {ref_num}")
+        if not content or len(content.strip()) < 20:
+            per_ref_verdicts.append({
+                "ref_num": ref_num,
+                "verdict": "UNVERIFIABLE",
+                "confidence": 0.0,
+                "evidence_quote": "",
+                "reasoning": f"ref [{ref_num}] has no resolvable content",
+                "error": "no_content",
+            })
+            continue
+
+        # Build a single-ref source block and call the LLM
+        if len(content) <= 4000:
+            relevant = content
+        else:
+            relevant = _find_relevant_spans(claim_text, content)
+        source_block = f"[{ref_num}] {title}\n{relevant}"
+
+        user_prompt = (
+            f"ORIGINAL QUESTION: {question}\n\n"
+            f"CLAIM ATTRIBUTED TO YOU: {claim_text}\n\n"
+            f"YOUR CONTENT:\n{source_block}"
+        )
+
+        # n_votes: majority over the votes for this single ref
+        passes = []
+        for _ in range(max(1, n_votes)):
+            raw = llm_call(
+                CITATION_VERIFICATION_PROMPT,
+                user_prompt,
+                response_format={"type": "json_object"},
+            )
+            try:
+                passes.append(json.loads(raw))
+            except json.JSONDecodeError:
+                passes.append({
+                    "verdict": "UNVERIFIABLE",
+                    "confidence": 0.0,
+                    "evidence_quote": "",
+                    "evidence_start_phrase": "",
+                    "reasoning": "Failed to parse verification response",
+                })
+
+        if n_votes > 1:
+            vote_counts = Counter(p.get("verdict", "UNVERIFIABLE") for p in passes)
+            ref_verdict = vote_counts.most_common(1)[0][0]
+            ref_payload = next(p for p, v in zip(passes, [pp.get("verdict", "UNVERIFIABLE") for pp in passes]) if v == ref_verdict)
+        else:
+            ref_verdict = passes[0].get("verdict", "UNVERIFIABLE")
+            ref_payload = passes[0]
+
+        ref_confidence = float(ref_payload.get("confidence", 0.0))
+        per_ref_verdicts.append({
+            "ref_num": ref_num,
+            "verdict": ref_verdict,
+            "confidence": ref_confidence,
+            "evidence_quote": ref_payload.get("evidence_quote", ""),
+            "reasoning": ref_payload.get("reasoning", ""),
+        })
+
+        # Aggregate: take the strongest verdict
+        rank = _PER_REF_AGGREGATION_ORDER.index(ref_verdict) if ref_verdict in _PER_REF_AGGREGATION_ORDER else -1
+        if rank > best_rank:
+            best_rank = rank
+            best_verdict = ref_verdict
+            best_payload = ref_payload
+            chosen_ref = ref_num
+
+    if best_verdict is None:
+        # No ref had any content
+        return ClaimVerification(
+            question_id=question_id,
+            claim_id=f"{question_id}-C{claim_idx}",
+            claim_text=claim_text,
+            cited_refs=cited_refs,
+            verdict="UNVERIFIABLE",
+            confidence=0.0,
+            evidence_quote="",
+            evidence_reference="",
+            evidence_span_start=-1,
+            evidence_span_end=-1,
+            reasoning="No cited source had resolvable content",
+        )
+
+    evidence_quote = best_payload.get("evidence_quote", "")
+    evidence_ref = str(chosen_ref) if chosen_ref is not None else ""
+
+    # Compute span offset in the chosen source (best-effort)
+    span_start = -1
+    span_end = -1
+    if evidence_quote and chosen_ref is not None and 0 <= (chosen_ref - 1) < len(articles):
+        ref_idx = chosen_ref - 1
+        source_content = articles[ref_idx].get("content") or articles[ref_idx].get("abstract") or ""
+        if source_content:
+            pos = source_content.find(evidence_quote[:50])
+            if pos >= 0:
+                span_start = pos
+                span_end = pos + len(evidence_quote)
+            else:
+                start_phrase = best_payload.get("evidence_start_phrase", "")
+                if start_phrase:
+                    pos = source_content.find(start_phrase)
+                    if pos >= 0:
+                        span_start = pos
+                        span_end = pos + len(evidence_quote)
+
+    result = ClaimVerification(
+        question_id=question_id,
+        claim_id=f"{question_id}-C{claim_idx}",
+        claim_text=claim_text,
+        cited_refs=cited_refs,
+        verdict=best_verdict,
+        confidence=float(best_payload.get("confidence", 0.0)),
+        evidence_quote=evidence_quote,
+        evidence_reference=evidence_ref,
+        evidence_span_start=span_start,
+        evidence_span_end=span_end,
+        reasoning=(
+            f"Per-ref verification: {len(per_ref_verdicts)} ref(s) evaluated; "
+            f"strongest ref [{chosen_ref}] returned {best_verdict}. "
+            + best_payload.get("reasoning", "")
+        ),
+    )
+    # Attach the per-ref breakdown as a non-standard attribute for callers
+    # that want the full picture. Dataclass allows this.
+    setattr(result, "per_ref_verdicts", per_ref_verdicts)
+    return result
+
+
+def verify_citations_for_question(entry: dict, search_backup: bool = False, n_votes: int = 1, single_claim: bool = False, per_ref: bool = False) -> list:
     """Run full citation verification for one Q&A entry.
-    
+
     If single_claim=True, the entire synopsis is treated as one atomic claim
     (citation numbers extracted deterministically via regex) instead of being
     passed through decompose_claims(). Use this when the input is already
     pre-atomized (one claim, one citation per entry) — e.g. benchmark datasets
     built from Related Work clauses — to avoid an unnecessary, non-deterministic
     LLM-based splitting pass that changes the unit of evaluation.
+
+    If per_ref=True, each cited ref is verified independently and the
+    verdicts are aggregated (any SUPPORTED ref promotes the claim).
+    This is the correct behavior for multi-ref claims. The benchmark
+    path uses per_ref=False for backward compatibility (the pre-paired
+    benchmark only has 1 ref per claim, so the per-ref vs. single-call
+    distinction is moot); the website path uses per_ref=True.
     """
     question_id = entry.get("question_id", "UNKNOWN")
     question = entry.get("question", "")
@@ -805,12 +1020,20 @@ def verify_citations_for_question(entry: dict, search_backup: bool = False, n_vo
 
     results = []
     for i, claim in enumerate(claims, 1):
-        result = verify_single_claim(
-            claim, articles, question, question_id, i,
-            search_backup=search_backup,
-            search_fn=search_pubmed if search_backup else None,
-            n_votes=n_votes,
-        )
+        if per_ref:
+            result = verify_claim_per_ref(
+                claim, articles, question, question_id, i,
+                search_backup=search_backup,
+                search_fn=search_pubmed if search_backup else None,
+                n_votes=n_votes,
+            )
+        else:
+            result = verify_single_claim(
+                claim, articles, question, question_id, i,
+                search_backup=search_backup,
+                search_fn=search_pubmed if search_backup else None,
+                n_votes=n_votes,
+            )
         results.append(result)
 
     return results
@@ -1046,7 +1269,7 @@ def compute_eval_metrics(results: list) -> dict:
 
 # ─── Main Pipeline ──────────────────────────────────────────────────────────
 
-def run_citation_verification(data: list, output_dir: Path, search_backup: bool = False, n_votes: int = 1, single_claim: bool = False) -> dict:
+def run_citation_verification(data: list, output_dir: Path, search_backup: bool = False, n_votes: int = 1, single_claim: bool = False, per_ref: bool = False) -> dict:
     """Run citation verification across all questions."""
     print(f"\n{'='*60}")
     print("TASK 1: CITATION ACCURACY VERIFICATION")
@@ -1056,6 +1279,8 @@ def run_citation_verification(data: list, output_dir: Path, search_backup: bool 
         print(f"  [STABLE MODE] {n_votes}-vote majority per claim (controls for LLM non-determinism)")
     if single_claim:
         print("  [SINGLE-CLAIM MODE] Treating each entry's synopsis as one atomic claim (no decomposition)")
+    if per_ref:
+        print("  [PER-REF MODE] Verifying each cited ref independently (correct for multi-ref claims)")
     print(f"{'='*60}")
     print(f"Processing {len(data)} questions...")
 
@@ -1065,7 +1290,7 @@ def run_citation_verification(data: list, output_dir: Path, search_backup: bool 
     for i, entry in enumerate(data, 1):
         qid = entry.get("question_id", f"Q{i}")
         print(f"\n[{i}/{len(data)}] Question: {qid}")
-        results = verify_citations_for_question(entry, search_backup=search_backup, n_votes=n_votes, single_claim=single_claim)
+        results = verify_citations_for_question(entry, search_backup=search_backup, n_votes=n_votes, single_claim=single_claim, per_ref=per_ref)
         all_results.extend(results)
         per_question[qid] = compute_citation_metrics(results)
 
@@ -1277,6 +1502,13 @@ def main():
              "one citation per entry) — this is the mode used to produce the paper's reported numbers."
     )
     parser.add_argument(
+        "--per-ref", action="store_true",
+        help="Verify each cited ref independently and aggregate verdicts (any SUPPORTED ref "
+             "promotes the claim). This is the correct mode for multi-ref claims. The benchmark "
+             "path uses single-call (default) for backward compatibility with the published "
+             "numbers; the website uses per-ref."
+    )
+    parser.add_argument(
         "--strictness", choices=["lenient", "strict"], default="lenient",
         help="Strictness dial for flagging hallucinations. 'lenient' (default) flags only clear "
              "non-support (NOT_SUPPORTED/CONTRADICTED) — favors precision. 'strict' also flags "
@@ -1319,7 +1551,7 @@ def main():
     eval_metrics = {}
 
     if args.task in ("citation", "both"):
-        citation_metrics = run_citation_verification(data, output_dir, search_backup=args.search_backup, n_votes=n_votes, single_claim=args.single_claim)
+        citation_metrics = run_citation_verification(data, output_dir, search_backup=args.search_backup, n_votes=n_votes, single_claim=args.single_claim, per_ref=args.per_ref)
 
     if args.task in ("evaluation", "both"):
         eval_metrics = run_evaluation_verification(data, output_dir)

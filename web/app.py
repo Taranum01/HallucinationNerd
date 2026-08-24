@@ -227,95 +227,98 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
     if all_cited:
         resolved_sources = resolve_and_fetch_all(text, list(all_cited))
 
-    # Step 3: Verify each claim against its resolved source(s)
+    # Step 3: Verify each claim using per-ref verification (C1 fix)
+    # The old code picked the first accessible ref and verified the whole
+    # sentence against it, which produced PARTIALLY_SUPPORTED for multi-ref
+    # claims. The new code verifies each ref independently and aggregates.
+    from verify_hallucinations import verify_claim_per_ref, _find_relevant_spans
+
     results = []
     for claim_data in claims:
         claim_text = claim_data.get("claim_text", claim_data.get("claim", ""))
         cited_refs = claim_data.get("cited_refs", [])
 
-        result = {
-            "claim": claim_text,
-            "cited_refs": cited_refs,
-            "verdict": "UNVERIFIABLE",
-            "confidence": 0.0,
-            "evidence_quote": "",
-            "reasoning": "",
-            "citation_exists": None,
-        }
-
         if not cited_refs:
-            result["reasoning"] = "No citation provided for this claim."
-            results.append(result)
+            results.append({
+                "claim": claim_text,
+                "cited_refs": cited_refs,
+                "verdict": "UNVERIFIABLE",
+                "confidence": 0.0,
+                "evidence_quote": "",
+                "reasoning": "No citation provided for this claim.",
+                "citation_exists": None,
+                "per_ref_verdicts": [],
+            })
             continue
 
-        # Try ALL cited refs until we find one we can access (not just the first)
-        source_content = None
-        ref_key = None
+        # Build the articles list (positional [N] -> articles[N-1]) for the engine.
+        # Each cited ref becomes one article. Unresolvable refs are skipped;
+        # verify_claim_per_ref marks them as UNVERIFIABLE.
+        articles = []
+        resolved_ref_keys = []
+        unresolved_refs = []
         for ref in cited_refs:
             rk = str(ref)
             content = resolved_sources.get(rk)
-            if content and len(content) > 100:
-                source_content = content
-                ref_key = rk
-                break
+            if content and len(content.strip()) > 20:
+                # Chunk the source content with keyword-overlap so the LLM sees
+                # the most relevant spans, not the whole (potentially 50K-char) source.
+                chunked = _find_relevant_spans(claim_text, content)
+                if not chunked or len(chunked) < 50:
+                    chunked = content[:15000]
+                articles.append({"id": rk, "content": chunked})
+                resolved_ref_keys.append(ref)
+            else:
+                unresolved_refs.append(ref)
 
-        if not source_content:
-            result["reasoning"] = f"Could not access any source for references [{', '.join(str(r) for r in cited_refs)}]. The cited sources may be behind a paywall, unavailable, or could not be resolved."
-            result["citation_exists"] = False
-            results.append(result)
+        if not articles:
+            unresolved_list = ", ".join(str(r) for r in cited_refs)
+            results.append({
+                "claim": claim_text,
+                "cited_refs": cited_refs,
+                "verdict": "UNVERIFIABLE",
+                "confidence": 0.0,
+                "evidence_quote": "",
+                "reasoning": (
+                    f"Could not access any source for references [{unresolved_list}]. "
+                    f"The cited sources may be behind a paywall, unavailable, or could not be resolved."
+                ),
+                "citation_exists": False,
+                "unresolved_refs": unresolved_refs,
+                "per_ref_verdicts": [],
+            })
             continue
 
-        # We have source content — verify the claim against it
-        result["citation_exists"] = True
-
-        # For claims with many refs, extract just the clause relevant to the ref we're checking
-        # This makes verification more precise (full sentence might cover multiple papers)
-        verification_text = claim_text
-        if len(cited_refs) > 3:
-            # Try to extract the specific clause near this ref's mention
-            clause = _extract_clause_for_ref(claim_text, ref_key)
-            if clause:
-                verification_text = clause
-
-        # The verification engine uses positional indexing (ref [1] = articles[0]).
-        # Strip original citation markers and map to [1] since we provide exactly one article.
-        # Use keyword-overlap chunking to find the relevant passage (same as benchmark)
-        import re as _re
-        from verify_hallucinations import _find_relevant_spans
-        clean_text = _re.sub(r'\[\d+(?:,\s*\d+)*\]', '', verification_text).strip()
-        
-        # Chunk the source to the most relevant passage (same technique as benchmark)
-        chunked_content = _find_relevant_spans(clean_text, source_content)
-        if not chunked_content or len(chunked_content) < 50:
-            chunked_content = source_content[:15000]
-        
-        synopsis_with_ref = f"{clean_text} [1]"
-        verification = verify_citations_for_question(
-            entry={
-                "question_id": hashlib.md5(claim_text.encode()).hexdigest()[:12],
-                "synopsis": synopsis_with_ref,
-                "retrieved_articles": [{"id": "1", "content": chunked_content}],
-            },
-            single_claim=True,
+        # Per-ref verification: one LLM call per ref, aggregate strongest
+        verification = verify_claim_per_ref(
+            claim={"claim_text": claim_text, "cited_refs": cited_refs},
+            articles=articles,
+            question="",  # website path doesn't have an original question
+            question_id=hashlib.md5(claim_text.encode()).hexdigest()[:12],
+            claim_idx=1,
         )
-        if verification:
-            v = verification[0] if isinstance(verification, list) else verification
-            if hasattr(v, 'verdict'):
-                result.update({
-                    "verdict": v.verdict,
-                    "confidence": v.confidence,
-                    "evidence_quote": v.evidence_quote,
-                    "reasoning": v.reasoning,
-                })
-            else:
-                result.update({
-                    "verdict": v.get("verdict", "UNVERIFIABLE"),
-                    "confidence": v.get("confidence", 0.0),
-                    "evidence_quote": v.get("evidence_quote", ""),
-                    "reasoning": v.get("reasoning", ""),
-                })
+        per_ref = getattr(verification, "per_ref_verdicts", [])
 
-        results.append(result)
+        # Map per-ref verdicts back to the original ref numbers (resolved_ref_keys
+        # are 1-indexed, articles are 0-indexed; we just translate the article idx
+        # to the original ref num).
+        ref_idx_to_num = {i + 1: resolved_ref_keys[i] for i in range(len(resolved_ref_keys))}
+        for entry in per_ref:
+            if entry.get("ref_num") in (None, 0):
+                entry["ref_num"] = ref_idx_to_num.get(entry.get("ref_num"), entry.get("ref_num"))
+
+        results.append({
+            "claim": claim_text,
+            "cited_refs": cited_refs,
+            "verdict": verification.verdict,
+            "confidence": verification.confidence,
+            "evidence_quote": verification.evidence_quote,
+            "evidence_reference": verification.evidence_reference,
+            "reasoning": verification.reasoning,
+            "citation_exists": True,
+            "unresolved_refs": unresolved_refs,
+            "per_ref_verdicts": per_ref,
+        })
 
     # Step 4: Compute summary
     total = len(results)
