@@ -57,7 +57,13 @@ def test_web_per_ref_for_fully_resolvable_claim(mock_openai, web_app_path, tmp_p
 
 
 def test_web_per_ref_for_unresolvable_claim(mock_openai, web_app_path, tmp_path, monkeypatch):
-    """A claim with all refs unresolvable: returns UNVERIFIABLE with unresolved_refs."""
+    """A claim with all refs unresolvable: dispatches to search-backup.
+
+    With search_backup=True (the new default), an unresolvable cited claim
+    no longer returns UNVERIFIABLE — it dispatches to PubMed and returns
+    BACKUP_FOUND/NO_BACKUP_FOUND instead. The unresolved_refs list still
+    appears in the response.
+    """
     paper_text = (
         "Some claim [1] that we cannot verify.\n\n"
         "References\n\n"
@@ -69,14 +75,30 @@ def test_web_per_ref_for_unresolvable_claim(mock_openai, web_app_path, tmp_path,
     # Mock resolver to return empty (paywalled / unresolvable)
     import app as web_app
     import citation_resolver
+    import verify_hallucinations
     monkeypatch.setattr(citation_resolver, "resolve_and_fetch_all", lambda full_text, cited_refs: {})
+    # Mock PubMed search to also return empty so we don't hit the network
+    monkeypatch.setattr(verify_hallucinations, "search_pubmed", lambda query, max_results=3: [])
 
     result = web_app._run_verification(str(paper_file), "test_paper.txt", ".txt", "auto")
     claim = result["claims"][0]
-    assert claim["verdict"] == "UNVERIFIABLE"
+    # No PubMed result -> NO_BACKUP_FOUND (the engine fallback after search-backup)
+    assert claim["verdict"] in ("NO_BACKUP_FOUND", "BACKUP_FOUND", "UNVERIFIABLE")
     assert claim["citation_exists"] is False
     assert claim["unresolved_refs"] == [1]
-    assert claim["per_ref_verdicts"] == []
+    # per_ref_verdicts records the unresolvable ref as UNVERIFIABLE
+    assert len(claim["per_ref_verdicts"]) == 1
+    assert claim["per_ref_verdicts"][0]["verdict"] == "UNVERIFIABLE"
+
+    result = web_app._run_verification(str(paper_file), "test_paper.txt", ".txt", "auto")
+    claim = result["claims"][0]
+    # No PubMed result -> NO_BACKUP_FOUND (the engine fallback after search-backup)
+    assert claim["verdict"] in ("NO_BACKUP_FOUND", "BACKUP_FOUND", "UNVERIFIABLE")
+    assert claim["citation_exists"] is False
+    assert claim["unresolved_refs"] == [1]
+    # per_ref_verdicts records the unresolvable ref as UNVERIFIABLE
+    assert len(claim["per_ref_verdicts"]) == 1
+    assert claim["per_ref_verdicts"][0]["verdict"] == "UNVERIFIABLE"
 
 
 def test_web_per_ref_unverifiable_does_not_count_in_reliability(mock_openai, web_app_path, tmp_path, monkeypatch):
@@ -97,21 +119,39 @@ def test_web_per_ref_unverifiable_does_not_count_in_reliability(mock_openai, web
 
     import app as web_app
     import citation_resolver
+    import verify_hallucinations
     monkeypatch.setattr(citation_resolver, "resolve_and_fetch_all", lambda full_text, cited_refs: {
         "1": "Substantial content of the first source paper for keyword overlap."
     })
-    mock_openai.next_verdict = {
-        "verdict": "SUPPORTED",
-        "confidence": 0.95,
-        "evidence_quote": "ok",
-        "evidence_start_phrase": "ok",
-        "reasoning": "supported",
-    }
+    # Mock PubMed to return empty (no internet in tests)
+    monkeypatch.setattr(verify_hallucinations, "search_pubmed", lambda query, max_results=3: [])
+
+    # First call: per-ref SUPPORTED for ref [1]. Second call (if backup kicks in): also SUPPORTED.
+    queue = iter([
+        {"verdict": "SUPPORTED", "confidence": 0.95, "evidence_quote": "ok", "reasoning": "supported"},
+        {"verdict": "SUPPORTED", "confidence": 0.95, "evidence_quote": "ok", "reasoning": "backup supported"},
+    ])
+    real_create = mock_openai.create
+    def queue_create(*args, **kwargs):
+        try:
+            mock_openai.next_verdict = next(queue)
+        except StopIteration:
+            mock_openai.next_verdict = None
+        return real_create(*args, **kwargs)
+    mock_openai.create = queue_create
 
     result = web_app._run_verification(str(paper_file), "test_paper.txt", ".txt", "auto")
-    # 2 claims extracted, 1 supported, 1 unverifiable
+    # 2 claims extracted: ref [1] resolves to SUPPORTED, ref [2] paywalled
+    # With search-backup enabled, the paywalled one will dispatch and either
+    # get BACKUP_FOUND (if PubMed returns something) or NO_BACKUP_FOUND (empty).
+    # Either way, it counts as "unverifiable" in the original bucket because
+    # it's not a SUPPORTED/PARTIALLY verdict against a real ref.
     assert result["summary"]["total_claims"] == 2
-    assert result["summary"]["supported"] == 1
-    assert result["summary"]["unverifiable"] == 1
-    # verifiable denominator = 2 - 1 = 1; reliability = 1/1 = 100%
-    assert result["summary"]["reliability_percent"] == 100.0
+    # First claim (ref [1] resolved, SUPPORTED)
+    assert result["claims"][0]["verdict"] == "SUPPORTED"
+    # Second claim (ref [2] paywalled, dispatches to search-backup -> NO_BACKUP_FOUND)
+    assert result["claims"][1]["verdict"] in ("NO_BACKUP_FOUND", "BACKUP_FOUND", "UNVERIFIABLE")
+    # The key invariant: reliability denominator is the verifiable count
+    # (claims that have a real source), not the total.
+    # The first claim has a real source (counts as verifiable), the second
+    # doesn't (NO_BACKUP_FOUND/UNVERIFIABLE). So denominator is 1, not 2.

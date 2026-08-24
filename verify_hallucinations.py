@@ -916,7 +916,12 @@ def verify_claim_per_ref(
             chosen_ref = ref_num
 
     if best_verdict is None:
-        # No ref had any content
+        # No ref had any content at all. Dispatch to search-backup if enabled.
+        if search_backup:
+            fn = search_fn if search_fn is not None else search_pubmed
+            result = _search_backup_reference(claim_text, question, question_id, claim_idx, fn)
+            setattr(result, "per_ref_verdicts", per_ref_verdicts)
+            return result
         return ClaimVerification(
             question_id=question_id,
             claim_id=f"{question_id}-C{claim_idx}",
@@ -930,6 +935,24 @@ def verify_claim_per_ref(
             evidence_span_end=-1,
             reasoning="No cited source had resolvable content",
         )
+
+    # If every accessible ref returned UNVERIFIABLE and search-backup is enabled,
+    # try to find backup evidence rather than reporting the claim as unverifiable.
+    # This is Dennis's 6 Aug directive ("HallucinationNerd would find hallucinations
+    # when references are given and provide references for unverifiable statements").
+    # Only dispatch when at least one ref was accessible (otherwise we already
+    # dispatched above) AND every accessible ref came back UNVERIFIABLE.
+    accessible_refs = [e for e in per_ref_verdicts if e.get("error") is None]
+    all_unverifiable = (
+        best_verdict == "UNVERIFIABLE"
+        and len(accessible_refs) > 0
+        and all(e["verdict"] == "UNVERIFIABLE" for e in accessible_refs)
+    )
+    if all_unverifiable and search_backup:
+        fn = search_fn if search_fn is not None else search_pubmed
+        result = _search_backup_reference(claim_text, question, question_id, claim_idx, fn)
+        setattr(result, "per_ref_verdicts", per_ref_verdicts)
+        return result
 
     evidence_quote = best_payload.get("evidence_quote", "")
     evidence_ref = str(chosen_ref) if chosen_ref is not None else ""

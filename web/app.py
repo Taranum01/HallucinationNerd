@@ -252,8 +252,8 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
             continue
 
         # Build the articles list (positional [N] -> articles[N-1]) for the engine.
-        # Each cited ref becomes one article. Unresolvable refs are skipped;
-        # verify_claim_per_ref marks them as UNVERIFIABLE.
+        # Each cited ref becomes one article. Unresolvable refs are tracked
+        # separately so the response can surface them.
         articles = []
         resolved_ref_keys = []
         unresolved_refs = []
@@ -271,31 +271,19 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
             else:
                 unresolved_refs.append(ref)
 
-        if not articles:
-            unresolved_list = ", ".join(str(r) for r in cited_refs)
-            results.append({
-                "claim": claim_text,
-                "cited_refs": cited_refs,
-                "verdict": "UNVERIFIABLE",
-                "confidence": 0.0,
-                "evidence_quote": "",
-                "reasoning": (
-                    f"Could not access any source for references [{unresolved_list}]. "
-                    f"The cited sources may be behind a paywall, unavailable, or could not be resolved."
-                ),
-                "citation_exists": False,
-                "unresolved_refs": unresolved_refs,
-                "per_ref_verdicts": [],
-            })
-            continue
-
-        # Per-ref verification: one LLM call per ref, aggregate strongest
+        # Per-ref verification: one LLM call per ref, aggregate strongest.
+        # search_backup=True makes the engine dispatch to PubMed for cited-but-
+        # paywalled refs and for refs whose content is otherwise unverifiable
+        # (Dennis's 6 Aug directive: "HVE would find hallucinations when
+        # references are given and provide references for unverifiable
+        # statements").
         verification = verify_claim_per_ref(
             claim={"claim_text": claim_text, "cited_refs": cited_refs},
             articles=articles,
             question="",  # website path doesn't have an original question
             question_id=hashlib.md5(claim_text.encode()).hexdigest()[:12],
             claim_idx=1,
+            search_backup=True,
         )
         per_ref = getattr(verification, "per_ref_verdicts", [])
 
@@ -307,6 +295,19 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
             if entry.get("ref_num") in (None, 0):
                 entry["ref_num"] = ref_idx_to_num.get(entry.get("ref_num"), entry.get("ref_num"))
 
+        # When no ref resolved at all, surface the unresolved_refs list and
+        # indicate the citation couldn't be reached. The engine has already
+        # dispatched to search-backup if the verdict is BACKUP_FOUND/NO_BACKUP_FOUND.
+        if not articles and unresolved_refs:
+            unresolved_list = ", ".join(str(r) for r in unresolved_refs)
+            note = (
+                f"Could not access any source for references [{unresolved_list}]. "
+                f"The cited sources may be behind a paywall, unavailable, or could not be resolved."
+            )
+            reasoning = f"{verification.reasoning}\n{note}" if verification.verdict in ("BACKUP_FOUND", "BACKUP_PARTIAL", "NO_BACKUP_FOUND") else note
+        else:
+            reasoning = verification.reasoning
+
         results.append({
             "claim": claim_text,
             "cited_refs": cited_refs,
@@ -314,8 +315,8 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
             "confidence": verification.confidence,
             "evidence_quote": verification.evidence_quote,
             "evidence_reference": verification.evidence_reference,
-            "reasoning": verification.reasoning,
-            "citation_exists": True,
+            "reasoning": reasoning,
+            "citation_exists": bool(articles),
             "unresolved_refs": unresolved_refs,
             "per_ref_verdicts": per_ref,
         })
