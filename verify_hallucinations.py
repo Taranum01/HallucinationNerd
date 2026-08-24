@@ -286,6 +286,32 @@ def llm_call(system_prompt: str, user_prompt: str, response_format=None) -> str:
     return ""
 
 
+def _clamp_confidence(value, default: float = 0.5) -> float:
+    """Clamp an LLM-reported confidence to [0.0, 1.0] and round to 4 decimals.
+
+    LLM confidence is a self-reported 0-1 float, but the model can return
+    values outside the range (negative, > 1, NaN, Inf) or with arbitrary
+    precision. This helper makes the value safe to serialize as JSON
+    and easy to compare. Replaces the raw `result.get('confidence', 0.0)`
+    pattern at every call site.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return round(default, 4)
+    if v != v:  # NaN check
+        return round(default, 4)
+    if v == float("inf"):
+        return 1.0
+    if v == float("-inf"):
+        return 0.0
+    if v < 0.0:
+        v = 0.0
+    elif v > 1.0:
+        v = 1.0
+    return round(v, 4)
+
+
 # ─── Task 1: Citation Accuracy Verification ─────────────────────────────────
 
 CLAIM_DECOMPOSITION_PROMPT = """You are an expert at decomposing text into atomic, standalone factual claims.
@@ -537,7 +563,7 @@ def _search_backup_reference(claim_text: str, question: str, question_id: str, c
                 claim_text=claim_text,
                 cited_refs=[],
                 verdict=final_verdict,
-                confidence=result.get("confidence", 0.5),
+                confidence=_clamp_confidence(result.get("confidence"), default=0.5),
                 evidence_quote=result.get("evidence_quote", ""),
                 evidence_reference=f"BACKUP: {title} ({url})",
                 evidence_span_start=-1,
@@ -758,7 +784,7 @@ def verify_single_claim(
         claim_text=claim_text,
         cited_refs=cited_refs,
         verdict=result.get("verdict", "UNVERIFIABLE"),
-        confidence=result.get("confidence", 0.0),
+        confidence=_clamp_confidence(result.get("confidence"), default=0.0),
         evidence_quote=evidence_quote,
         evidence_reference=evidence_ref,
         evidence_span_start=span_start,
@@ -982,7 +1008,7 @@ def verify_claim_per_ref(
         claim_text=claim_text,
         cited_refs=cited_refs,
         verdict=best_verdict,
-        confidence=float(best_payload.get("confidence", 0.0)),
+        confidence=_clamp_confidence(best_payload.get("confidence"), default=0.0),
         evidence_quote=evidence_quote,
         evidence_reference=evidence_ref,
         evidence_span_start=span_start,
