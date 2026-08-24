@@ -415,4 +415,8 @@ def _verify_structured_input(data: list) -> dict:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    # M18: default to localhost for safety. Set HOST=0.0.0.0 to expose
+    # publicly (e.g., behind a reverse proxy).
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host=host, port=port)

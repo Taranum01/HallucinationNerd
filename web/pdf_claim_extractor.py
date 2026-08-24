@@ -13,7 +13,7 @@ import re
 from typing import List
 
 
-def extract_cited_claims_from_text(text: str, max_claims: int = 50) -> List[dict]:
+def extract_cited_claims_from_text(text: str, max_claims: int = 200) -> List[dict]:
     """
     Extract sentences/clauses containing citation markers [N] from document text.
     Returns claims in the same format as decompose_claims.
@@ -87,6 +87,13 @@ def extract_cited_claims_from_text(text: str, max_claims: int = 50) -> List[dict
         })
 
         if len(claims) >= max_claims:
+            # H3: log a warning so silent truncation is visible in dev.
+            import sys
+            print(
+                f"  [WARN] claim extraction truncated at {max_claims} claims; "
+                f"raise max_claims parameter if you need more.",
+                file=sys.stderr,
+            )
             break
 
     return claims
