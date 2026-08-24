@@ -23,6 +23,30 @@ load_dotenv()
 # The verification engine files (verify_hallucinations.py, arxiv_extractor.py)
 # are co-located in this directory for deployment.
 
+# M19: per-IP rate limiting on /verify. Default: 5 requests per 60s.
+# Override with HVE_RATE_LIMIT_REQUESTS and HVE_RATE_LIMIT_WINDOW_SECONDS.
+# Uses a simple in-memory token bucket — single-process only. For
+# multi-worker deployments, swap in a Redis-backed limiter.
+import time as _time
+_rate_limit_requests = int(os.getenv("HVE_RATE_LIMIT_REQUESTS", "5"))
+_rate_limit_window = int(os.getenv("HVE_RATE_LIMIT_WINDOW_SECONDS", "60"))
+_rate_buckets: dict = {}  # ip -> [timestamps]
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Returns True if the request is allowed, False if rate-limited."""
+    now = _time.time()
+    bucket = _rate_buckets.get(ip, [])
+    # Drop timestamps outside the window
+    bucket = [t for t in bucket if now - t < _rate_limit_window]
+    if len(bucket) >= _rate_limit_requests:
+        _rate_buckets[ip] = bucket
+        return False
+    bucket.append(now)
+    _rate_buckets[ip] = bucket
+    return True
+
+
 app = FastAPI(title="HallucinationNerd", description="Citation Hallucination Verification")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -46,6 +70,15 @@ async def verify_document(
     """
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="Server misconfigured: no API key")
+
+    # M19: per-IP rate limit. Reject with 429 if the caller has burned
+    # through their budget in the current window.
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: max {_rate_limit_requests} requests per {_rate_limit_window}s. Try again later.",
+        )
 
     # L24: enforce a max upload size to prevent abuse. Default 25 MB.
     max_bytes = int(os.getenv("HVE_MAX_UPLOAD_BYTES", "26214400"))
