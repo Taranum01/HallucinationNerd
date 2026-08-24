@@ -1471,6 +1471,16 @@ def run_evaluation_verification(data: list, output_dir: Path) -> dict:
     print(f"{'='*60}")
     print(f"Processing {len(data)} questions...")
 
+    # M2: skip eval task entirely if the dataset has nothing evaluatable
+    has_eval = any(
+        (a.get("summary") or a.get("structured_extraction"))
+        for entry in data
+        for a in entry.get("retrieved_articles", entry.get("citations_obj", []))
+    )
+    if not has_eval:
+        print("  [SKIP] No 'summary' or 'structured_extraction' fields in dataset; nothing to evaluate.")
+        return {"total_evaluations": 0, "accuracy_rate": 0.0, "by_verdict": {}, "by_severity": {}}
+
     all_results = []
 
     for i, entry in enumerate(data, 1):

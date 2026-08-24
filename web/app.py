@@ -353,7 +353,9 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
             "contradicted": contradicted,
             "unverifiable": unverifiable,
             "reliability_percent": round(reliability_pct, 1),  # includes PARTIALLY
+            "reliability_percent_full": round(reliability_pct, 6),  # L14: full precision for export
             "precision_percent": round(precision_pct, 1),  # SUPPORTED only
+            "precision_percent_full": round(precision_pct, 6),
         },
         "claims": results,
     }
@@ -421,7 +423,9 @@ def _verify_structured_input(data: list) -> dict:
             "contradicted": contradicted,
             "unverifiable": unverifiable,
             "reliability_percent": round(reliability_pct, 1),  # includes PARTIALLY
+            "reliability_percent_full": round(reliability_pct, 6),  # L14: full precision
             "precision_percent": round(precision_pct, 1),  # SUPPORTED only
+            "precision_percent_full": round(precision_pct, 6),
         },
         "claims": all_results,
     }
