@@ -8,20 +8,20 @@ HallucinationNerd checks whether cited sources actually support the claims attri
 
 ## Key Results
 
-Evaluated on two benchmarks built from **100 randomly sampled arXiv papers** (one genuine claim per paper). For each paper, half of its arXiv citations are replaced with arXiv papers chosen uniformly at random, producing objective, annotation-free ground truth: a citation is **correct** or **incorrect**. A citation the system cannot verify is counted as incorrect (no exclusions).
+Evaluated on two benchmarks built from **100 randomly sampled arXiv papers** (one genuine claim per paper). For each paper, half of its arXiv citations are replaced with arXiv papers chosen uniformly at random, producing objective, annotation-free ground truth: a citation is **correct** or **incorrect**. A citation whose source cannot be accessed is excluded from scoring (not counted as a hallucination), matching the evaluation in the paper.
 
 | Benchmark | Accuracy | Precision | Recall |
 |-----------|----------|-----------|--------|
-| Cross-category (out-of-field) — 200 pairs | **89.5%** | 82.6% | 100% |
-| Same-field (in-field) — 196 pairs | **89.3%** | 82.1% | 100% |
+| Cross-category (out-of-field) — 200 pairs (183 scored) | **91.3%** | 84.6% | 100% |
+| Same-field (in-field) — 196 pairs (182 scored) | **91.2%** | 84.5% | 100% |
 
-Against the systems we ran on identical data — **MiniCheck** and **RAGAS** — HallucinationNerd is far ahead: both competitors sit near chance (53–56% accuracy) because they flag roughly half of the *correct* citations, while HallucinationNerd keeps false positives low. Paired non-parametric permutation tests confirm the gap is significant (p < 0.0001 on both benchmarks). Additional NLI baselines (HHEM 2.1, AlignScore, SummaCConv) are evaluated in the paper.
+Against the systems we ran on identical data — **MiniCheck** and **RAGAS** — HallucinationNerd is far ahead: both competitors sit near chance (52–56% accuracy) because they flag roughly half of the *correct* citations, while HallucinationNerd keeps false positives low. Paired non-parametric permutation tests confirm the gap is significant (p < 0.0001 on both benchmarks). Additional NLI baselines (HHEM 2.1, AlignScore, SummaCConv) are evaluated in the paper.
 
 | System | Cross-category Acc | Same-field Acc |
 |---|---|---|
-| **HallucinationNerd** | **89.5%** | **89.3%** |
-| RAGAS | 56.0% | 56.1% |
-| MiniCheck | 53.5% | 52.6% |
+| **HallucinationNerd** | **91.3%** | **91.2%** |
+| RAGAS | 54.6% | 55.5% |
+| MiniCheck | 51.9% | 51.6% |
 
 ## How It Works
 
@@ -30,7 +30,7 @@ Against the systems we ran on identical data — **MiniCheck** and **RAGAS** —
 3. **Document Interrogation** — Asks the source document itself whether it supports the claim using a structured LLM judge
 4. **Aggregation** — Produces per-claim conclusions, evidence quotes, and overall reliability scores
 
-For uncited claims, the system searches PubMed for backup references (`--search-backup` mode).
+For uncited claims, the system runs a backup search over user-selectable databases — PubMed, arXiv, and Semantic Scholar (plus an optional user-supplied search URL) — via `--search-backup` (CLI) or the source-database checkboxes in the web app.
 
 ## Installation
 
@@ -54,7 +54,7 @@ OPENAI_API_KEY=your-key-here
 # Verify citations in a document
 python verify_hallucinations.py --input data.json --output-dir results/ --task citation
 
-# Also search PubMed for uncited claims
+# Also run backup search (PubMed / arXiv / Semantic Scholar) for uncited claims
 python verify_hallucinations.py --input data.json --output-dir results/ --task citation --search-backup
 
 # Strictness: 'lenient' (default, precision-oriented) or 'strict' (recall-oriented)
@@ -86,8 +86,8 @@ Sources can be pre-extracted text (`content`), URLs to fetch (`url`), or PDF/tex
 | `PARTIALLY_SUPPORTED` | Source discusses the topic; gist correct but specifics differ |
 | `NOT_SUPPORTED` | Source does not contain information relevant to this claim |
 | `CONTRADICTED` | Source explicitly states the opposite |
-| `UNVERIFIABLE` | Source content unavailable (counted as incorrect in scoring) |
-| `BACKUP_FOUND` / `NO_BACKUP_FOUND` | Uncited claim: PubMed search found / did not find supporting evidence |
+| `UNVERIFIABLE` | Source content could not be accessed (excluded from scoring) |
+| `BACKUP_FOUND` / `NO_BACKUP_FOUND` | Uncited claim: backup search over the selected databases found / did not find supporting evidence |
 
 ## Benchmarks & Reproduction
 
