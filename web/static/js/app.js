@@ -78,6 +78,9 @@ form.addEventListener('submit', async (e) => {
     const formData = new FormData();
     formData.append('file', fileInput.files[0]);
     formData.append('source_type', document.getElementById('sourceType').value);
+    const selectedDbs = [...document.querySelectorAll('.dbCheck:checked')].map(c => c.value);
+    formData.append('databases', selectedDbs.join(','));
+    formData.append('custom_database', document.getElementById('customDatabase').value.trim());
 
     try {
         const response = await fetch('/verify', { method: 'POST', body: formData });
@@ -131,10 +134,18 @@ function renderResults(data) {
     const notSupportedRefs = new Set();
     const inaccessibleRefs = new Set();
     let noCitationCount = 0;
+    let backupFoundCount = 0;
+    let noBackupCount = 0;
 
     data.claims.forEach(c => {
         const refs = c.cited_refs || [];
-        if (refs.length === 0) { noCitationCount++; return; }
+        if (refs.length === 0) {
+            // Uncited claim: bucket by backup-search outcome
+            if (c.verdict === 'BACKUP_FOUND') backupFoundCount++;
+            else if (c.verdict === 'NO_BACKUP_FOUND') noBackupCount++;
+            else noCitationCount++;
+            return;
+        }
         refs.forEach(r => {
             if (c.citation_exists === true) {
                 existingRefs.add(r);
@@ -172,6 +183,16 @@ function renderResults(data) {
         document.getElementById('catNoCitationRefs').textContent =
             ` ${noCitationCount} claim${noCitationCount === 1 ? '' : 's'} with no inline citation`;
     }
+    if (backupFoundCount > 0) {
+        document.getElementById('catBackupFound').classList.remove('hidden');
+        document.getElementById('catBackupFoundRefs').textContent =
+            ` ${backupFoundCount} uncited claim${backupFoundCount === 1 ? '' : 's'} matched to a supporting source`;
+    }
+    if (noBackupCount > 0) {
+        document.getElementById('catNoBackup').classList.remove('hidden');
+        document.getElementById('catNoBackupRefs').textContent =
+            ` ${noBackupCount} uncited claim${noBackupCount === 1 ? '' : 's'} with no supporting source found`;
+    }
 
     // Show detailed claims header
     document.getElementById('detailsHeader').style.display = 'block';
@@ -182,9 +203,17 @@ function renderResults(data) {
         card.className = `p-4 rounded-lg fade-in ${getVerdictClass(claim.verdict)}`;
         card.style.animationDelay = `${i * 0.05}s`;
 
-        const verdictBadge = (!claim.cited_refs || claim.cited_refs.length === 0)
-            ? { label: '— No Citation Provided', class: 'bg-purple-100 text-purple-700' }
-            : getVerdictBadge(claim.verdict);
+        const noRefs = (!claim.cited_refs || claim.cited_refs.length === 0);
+        let verdictBadge;
+        if (claim.verdict === 'BACKUP_FOUND') {
+            verdictBadge = { label: `✓ Backup Source Found${claim.backup_source ? ' — ' + claim.backup_source : ''}`, class: 'bg-teal-100 text-teal-700' };
+        } else if (claim.verdict === 'NO_BACKUP_FOUND') {
+            verdictBadge = { label: '✗ No Backup Source', class: 'bg-orange-100 text-orange-700' };
+        } else if (noRefs) {
+            verdictBadge = { label: '— No Citation Provided', class: 'bg-purple-100 text-purple-700' };
+        } else {
+            verdictBadge = getVerdictBadge(claim.verdict);
+        }
         const confidence = claim.confidence ? `${Math.round(claim.confidence * 100)}%` : '';
 
         card.innerHTML = `
@@ -218,6 +247,8 @@ function getVerdictClass(verdict) {
         case 'PARTIALLY_SUPPORTED': return 'verdict-partial';
         case 'NOT_SUPPORTED': return 'verdict-not-supported';
         case 'CONTRADICTED': return 'verdict-contradicted';
+        case 'BACKUP_FOUND': return 'verdict-backup-found';
+        case 'NO_BACKUP_FOUND': return 'verdict-no-backup';
         default: return 'verdict-unverifiable';
     }
 }

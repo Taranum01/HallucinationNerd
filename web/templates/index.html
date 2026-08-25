@@ -11,6 +11,8 @@
         .verdict-not-supported { background: #fee2e2; border-left: 4px solid #dc2626; }
         .verdict-contradicted { background: #fecaca; border-left: 4px solid #991b1b; }
         .verdict-unverifiable { background: #f3f4f6; border-left: 4px solid #6b7280; }
+        .verdict-backup-found { background: #ccfbf1; border-left: 4px solid #0d9488; }
+        .verdict-no-backup { background: #ffedd5; border-left: 4px solid #ea580c; }
         .fade-in { animation: fadeIn 0.3s ease-in; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
         .spinner { border: 3px solid #e5e7eb; border-top: 3px solid #2563eb; border-radius: 50%; width: 24px; height: 24px; animation: spin 0.8s linear infinite; }
@@ -37,6 +39,23 @@
                     <option value="json">JSON (structured input)</option>
                     <option value="text">Plain text</option>
                 </select>
+
+                <label class="text-sm font-semibold text-gray-700 mb-2">Search databases for claims with no citation:</label>
+                <p class="text-xs text-gray-500 mb-2">When a claim has no inline citation, look for supporting evidence in the databases you select below.</p>
+                <div class="flex flex-col gap-1.5 mb-3">
+                    <label class="flex items-center gap-2 text-sm text-gray-700">
+                        <input type="checkbox" name="db" value="pubmed" class="dbCheck rounded border-gray-300"> PubMed
+                    </label>
+                    <label class="flex items-center gap-2 text-sm text-gray-700">
+                        <input type="checkbox" name="db" value="arxiv" class="dbCheck rounded border-gray-300"> arXiv
+                    </label>
+                    <label class="flex items-center gap-2 text-sm text-gray-700">
+                        <input type="checkbox" name="db" value="semantic_scholar" class="dbCheck rounded border-gray-300"> Semantic Scholar
+                    </label>
+                </div>
+                <input type="text" id="customDatabase" name="custom_database"
+                    placeholder="Add your own: search-URL with {query}"
+                    class="border border-gray-300 rounded-md px-3 py-2 mb-6 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
 
                 <label class="text-sm font-semibold text-gray-700 mb-2">Upload Document:</label>
                 <div id="dropZone" 
@@ -124,6 +143,14 @@
                     <div id="catNoCitation" class="hidden p-3 bg-purple-50 border border-purple-200 rounded">
                         <span class="font-semibold text-purple-800">No Citation Provided:</span>
                         <span class="text-purple-700" id="catNoCitationRefs"></span>
+                    </div>
+                    <div id="catBackupFound" class="hidden p-3 bg-teal-50 border border-teal-200 rounded">
+                        <span class="font-semibold text-teal-800">Uncited Claim — Supporting Source Found:</span>
+                        <span class="text-teal-700" id="catBackupFoundRefs"></span>
+                    </div>
+                    <div id="catNoBackup" class="hidden p-3 bg-orange-50 border border-orange-200 rounded">
+                        <span class="font-semibold text-orange-800">Uncited Claim — No Supporting Source Found:</span>
+                        <span class="text-orange-700" id="catNoBackupRefs"></span>
                     </div>
                     <div id="catInaccessible" class="hidden p-3 bg-gray-100 border border-gray-300 rounded">
                         <span class="font-semibold text-gray-700">Inaccessible Articles:</span>

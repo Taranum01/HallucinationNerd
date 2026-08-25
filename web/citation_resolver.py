@@ -476,6 +476,71 @@ def _search_semantic_scholar(query: str) -> Optional[str]:
     return None
 
 
+def _search_pubmed(query: str) -> Optional[str]:
+    """Search PubMed by query and return the top hit's abstract (backup search)."""
+    _rate_limit()
+    try:
+        search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        params = {"db": "pubmed", "term": query, "retmax": 1, "retmode": "json"}
+        resp = requests.get(search_url, params=params, timeout=10)
+        if resp.status_code != 200:
+            return None
+        ids = resp.json().get("esearchresult", {}).get("idlist", [])
+        if not ids:
+            return None
+        return _fetch_pubmed_abstract(ids[0])
+    except Exception:
+        return None
+
+
+# User-selectable backup-search databases (the professor's checkbox request).
+# Order in the UI: PubMed, arXiv, Semantic Scholar.
+_DB_SEARCHERS = {
+    "pubmed": ("PubMed", _search_pubmed),
+    "arxiv": ("arXiv", _search_arxiv_by_title),
+    "semantic_scholar": ("Semantic Scholar", _search_semantic_scholar),
+}
+
+# Databases searched when the caller enables backup search but names none explicitly.
+DEFAULT_BACKUP_DATABASES = ["pubmed", "arxiv", "semantic_scholar"]
+
+
+def backup_search(query: str, databases: list, custom_url_template: str = ""):
+    """
+    Backup reference search for a claim that carries NO inline citation.
+
+    Searches only the user-selected `databases` (keys from _DB_SEARCHERS), in the
+    order given, and optionally a user-supplied database via a search-URL template
+    containing the literal '{query}'. This is what backs the source-database
+    checkboxes in the web UI ("let the user pick / add databases").
+
+    Returns (content, source_label) for the first database that yields usable
+    content, else (None, None).
+    """
+    for db in databases:
+        key = str(db).strip().lower().replace(" ", "_").replace("-", "_")
+        entry = _DB_SEARCHERS.get(key)
+        if not entry:
+            continue
+        label, fn = entry
+        try:
+            content = fn(query)
+        except Exception:
+            content = None
+        if content and len(content) > 100:
+            return content, label
+
+    # Optional user-supplied database: a search-URL template with a {query} slot.
+    if custom_url_template and "{query}" in custom_url_template:
+        import urllib.parse
+        url = custom_url_template.replace("{query}", urllib.parse.quote(query[:200]))
+        content = _fetch_url_safe(url)
+        if content and len(content) > 100:
+            return content, "Custom database"
+
+    return None, None
+
+
 def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
     """
     Main entry point: given full document text and a list of citation markers

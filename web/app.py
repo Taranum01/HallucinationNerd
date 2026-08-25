@@ -39,9 +39,14 @@ async def verify_document(
     request: Request,
     file: UploadFile = File(...),
     source_type: str = Form(default="auto"),
+    databases: str = Form(default=""),
+    custom_database: str = Form(default=""),
 ):
     """
     Accept a document upload, extract claims + citations, verify each one.
+    For claims with no inline citation, optionally run a backup search over the
+    user-selected databases (comma-separated keys in `databases`, plus an optional
+    `custom_database` search-URL template containing '{query}').
     Returns JSON with per-claim results.
     """
     if not os.getenv("OPENAI_API_KEY"):
@@ -57,8 +62,11 @@ async def verify_document(
         tmp.write(content_bytes)
         tmp_path = tmp.name
 
+    db_list = [d.strip() for d in databases.split(",") if d.strip()]
     try:
-        results = await asyncio.to_thread(_run_verification, tmp_path, filename, suffix, source_type)
+        results = await asyncio.to_thread(
+            _run_verification, tmp_path, filename, suffix, source_type, db_list, custom_database.strip()
+        )
         return JSONResponse(content=results)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
@@ -154,11 +162,50 @@ def _extract_citation_rich_sections(text: str, max_chars: int = 12000) -> str:
     return text[:max_chars]
 
 
-def _run_verification(file_path: str, filename: str, suffix: str, source_type: str) -> dict:
+def _verify_one(claim_text: str, source_content: str) -> dict:
+    """Verify a single claim against a block of source content (used by the backup
+    search for uncited claims). Returns a dict with verdict/confidence/evidence."""
+    import re as _re
+    import hashlib as _hl
+    from verify_hallucinations import verify_citations_for_question, _find_relevant_spans
+
+    clean_text = _re.sub(r'\[\d+(?:,\s*\d+)*\]', '', claim_text).strip()
+    chunked = _find_relevant_spans(clean_text, source_content)
+    if not chunked or len(chunked) < 50:
+        chunked = source_content[:15000]
+
+    out = {"verdict": "UNVERIFIABLE", "confidence": 0.0, "evidence_quote": "", "reasoning": ""}
+    verification = verify_citations_for_question(
+        entry={
+            "question_id": _hl.md5((clean_text + "backup").encode()).hexdigest()[:12],
+            "synopsis": f"{clean_text} [1]",
+            "retrieved_articles": [{"id": "1", "content": chunked}],
+        },
+        single_claim=True,
+    )
+    if verification:
+        v = verification[0] if isinstance(verification, list) else verification
+        if hasattr(v, "verdict"):
+            out.update({"verdict": v.verdict, "confidence": v.confidence,
+                        "evidence_quote": v.evidence_quote, "reasoning": v.reasoning})
+        else:
+            out.update({"verdict": v.get("verdict", "UNVERIFIABLE"),
+                        "confidence": v.get("confidence", 0.0),
+                        "evidence_quote": v.get("evidence_quote", ""),
+                        "reasoning": v.get("reasoning", "")})
+    return out
+
+
+def _run_verification(file_path: str, filename: str, suffix: str, source_type: str,
+                      databases: list = None, custom_database: str = "") -> dict:
     """
     Run the HallucinationNerd pipeline on the uploaded file.
     This runs in a thread to not block the event loop.
+    `databases` is the list of user-selected backup-search databases (used for
+    claims with no inline citation); `custom_database` is an optional user-supplied
+    search-URL template.
     """
+    databases = databases or []
     from verify_hallucinations import (
         _parse_pdf,
         decompose_claims,
@@ -244,7 +291,38 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
         }
 
         if not cited_refs:
-            result["reasoning"] = "No citation provided for this claim."
+            # No inline citation. If the user enabled backup databases, search them
+            # for supporting evidence; otherwise report it as uncited.
+            if databases or custom_database:
+                from citation_resolver import backup_search
+                bcontent, bsource = backup_search(claim_text, databases, custom_database)
+                if bcontent:
+                    bv = _verify_one(claim_text, bcontent)
+                    if bv["verdict"] in ("SUPPORTED", "PARTIALLY_SUPPORTED"):
+                        result["verdict"] = "BACKUP_FOUND"
+                        result["backup_source"] = bsource
+                        result["confidence"] = bv["confidence"]
+                        result["evidence_quote"] = bv["evidence_quote"]
+                        result["reasoning"] = (
+                            f"No inline citation. Supporting evidence found via {bsource} "
+                            f"(verdict against that source: {bv['verdict']})."
+                        )
+                    else:
+                        result["verdict"] = "NO_BACKUP_FOUND"
+                        result["backup_source"] = bsource
+                        result["reasoning"] = (
+                            f"No inline citation. Searched {bsource}, but the top candidate "
+                            f"did not support the claim ({bv['verdict']})."
+                        )
+                else:
+                    result["verdict"] = "NO_BACKUP_FOUND"
+                    searched = ", ".join(databases) if databases else "custom database"
+                    result["reasoning"] = (
+                        f"No inline citation. No supporting source found in the selected "
+                        f"database(s): {searched}."
+                    )
+            else:
+                result["reasoning"] = "No citation provided for this claim."
             results.append(result)
             continue
 
@@ -324,9 +402,12 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
     not_supported = sum(1 for r in results if r["verdict"] == "NOT_SUPPORTED")
     contradicted = sum(1 for r in results if r["verdict"] == "CONTRADICTED")
     unverifiable = sum(1 for r in results if r["verdict"] == "UNVERIFIABLE")
+    backup_found = sum(1 for r in results if r["verdict"] == "BACKUP_FOUND")
+    no_backup_found = sum(1 for r in results if r["verdict"] == "NO_BACKUP_FOUND")
 
-    verifiable = total - unverifiable
-    reliability_pct = (supported + partial) / verifiable * 100 if verifiable > 0 else 0
+    # Verifiable = everything we could actually assess (backup outcomes count).
+    verifiable = supported + partial + not_supported + contradicted + backup_found + no_backup_found
+    reliability_pct = (supported + partial + backup_found) / verifiable * 100 if verifiable > 0 else 0
 
     return {
         "filename": filename,
@@ -337,6 +418,8 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
             "not_supported": not_supported,
             "contradicted": contradicted,
             "unverifiable": unverifiable,
+            "backup_found": backup_found,
+            "no_backup_found": no_backup_found,
             "reliability_percent": round(reliability_pct, 1),
         },
         "claims": results,
