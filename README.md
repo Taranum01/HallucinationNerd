@@ -12,16 +12,16 @@ Evaluated on two benchmarks built from **100 randomly sampled arXiv papers** (on
 
 | Benchmark | Accuracy | Precision | Recall |
 |-----------|----------|-----------|--------|
-| Cross-category (out-of-field) — 200 pairs (183 scored) | **91.3%** | 84.6% | 100% |
-| Same-field (in-field) — 196 pairs (182 scored) | **91.2%** | 84.5% | 100% |
+| Cross-category (out-of-field) — 200 pairs (185 scored) | **93.0%** | 88.1% | 100% |
+| Same-field (in-field) — 196 pairs (181 scored) | **92.8%** | 87.6% | 100% |
 
-Against the systems we ran on identical data — **MiniCheck** and **RAGAS** — HallucinationNerd is far ahead: both competitors sit near chance (52–56% accuracy) because they flag roughly half of the *correct* citations, while HallucinationNerd keeps false positives low. Paired non-parametric permutation tests confirm the gap is significant (p < 0.0001 on both benchmarks). Additional NLI baselines (HHEM 2.1, AlignScore, SummaCConv) are evaluated in the paper.
+Against the systems we ran on identical data — **MiniCheck** and **RAGAS** — HallucinationNerd is far ahead: both competitors sit near chance (55–58% accuracy) because they flag roughly half of the *correct* citations, while HallucinationNerd keeps false positives low. Paired non-parametric permutation tests confirm the gap is significant (p < 0.0001 on both benchmarks). Additional NLI baselines (HHEM 2.1, AlignScore, SummaCConv) are evaluated in the paper.
 
 | System | Cross-category Acc | Same-field Acc |
 |---|---|---|
-| **HallucinationNerd** | **91.3%** | **91.2%** |
-| RAGAS | 54.6% | 55.5% |
-| MiniCheck | 51.9% | 51.6% |
+| **HallucinationNerd** | **93.0%** | **92.8%** |
+| RAGAS | 58.4% | 58.0% |
+| MiniCheck | 55.7% | 54.7% |
 
 ## How It Works
 
