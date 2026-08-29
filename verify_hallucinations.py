@@ -240,6 +240,7 @@ class EvalVerification:
     verdict: str
     severity: str
     reasoning: str
+    confidence: float = 0.0
 
 
 # ─── LLM Client ─────────────────────────────────────────────────────────────
@@ -284,6 +285,32 @@ def llm_call(system_prompt: str, user_prompt: str, response_format=None) -> str:
             else:
                 raise
     return ""
+
+
+def _clamp_confidence(value, default: float = 0.5) -> float:
+    """Clamp an LLM-reported confidence to [0.0, 1.0] and round to 4 decimals.
+
+    LLM confidence is a self-reported 0-1 float, but the model can return
+    values outside the range (negative, > 1, NaN, Inf) or with arbitrary
+    precision. This helper makes the value safe to serialize as JSON
+    and easy to compare. Replaces the raw `result.get('confidence', 0.0)`
+    pattern at every call site.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return round(default, 4)
+    if v != v:  # NaN check
+        return round(default, 4)
+    if v == float("inf"):
+        return 1.0
+    if v == float("-inf"):
+        return 0.0
+    if v < 0.0:
+        v = 0.0
+    elif v > 1.0:
+        v = 1.0
+    return round(v, 4)
 
 
 # ─── Task 1: Citation Accuracy Verification ─────────────────────────────────
@@ -377,13 +404,19 @@ def extract_cited_refs(text: str) -> list:
     return refs
 
 
-def _find_relevant_spans(claim_text: str, content: str, max_chars: int = 4000, window: int = 500) -> str:
+def _find_relevant_spans(claim_text: str, content: str, max_chars: int = 4000, window: int = 1000, top_chunks: int = 12, anchor_chars: int = 500) -> str:
     """
     Find the most relevant spans in a long document for a given claim.
-    Uses keyword overlap to locate the best chunks, then returns them concatenated.
-    
-    This implements the HLD's "reference matching" — finding the most relevant
-    spans in the reference for each claim.
+    Uses keyword overlap to locate the best chunks, then returns them
+    concatenated, with the first and last `anchor_chars` of the document
+    always included as anchors so the LLM has context for intro/conclusion.
+
+    C7 fix: finer granularity (window=1000, step=200) and more chunks
+    (top 12 vs 8). The previous coarser window missed multi-clause claims
+    whose key terms were spread across the document.
+
+    This implements the HLD's "reference matching" — finding the most
+    relevant spans in the reference for each claim.
     """
     # Extract key terms from the claim
     stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'been', 'be', 'have', 'has',
@@ -391,51 +424,65 @@ def _find_relevant_spans(claim_text: str, content: str, max_chars: int = 4000, w
                   'shall', 'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in', 'for', 'on',
                   'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after',
                   'that', 'this', 'these', 'those', 'it', 'its', 'and', 'or', 'but', 'not', 'no'}
-    
-    claim_words = set(w.lower().strip('.,;:()[]') for w in claim_text.split() 
+
+    claim_words = set(w.lower().strip('.,;:()[]') for w in claim_text.split()
                      if len(w) > 3 and w.lower() not in stop_words)
-    
+
     if not claim_words:
         return content[:max_chars]
-    
+
+    # For very short content (shorter than the window), no chunking is
+    # needed; return as-is.
+    if len(content) <= window:
+        return content[:max_chars]
+
+    # Always include the first and last `anchor_chars` of the document so
+    # the LLM has intro/conclusion context even when key terms live in
+    # the middle.
+    anchors = []
+    head = content[:anchor_chars]
+    tail = content[-anchor_chars:] if len(content) > anchor_chars else ""
+    if head:
+        anchors.append((0, head))
+    if tail and tail != head:
+        anchors.append((len(content) - anchor_chars, tail))
+
     # Split content into overlapping windows and score each by keyword overlap
     chunks = []
-    step = window // 2  # 50% overlap
+    step = max(50, window // 5)  # 5 windows per window-width for finer granularity
     for i in range(0, len(content) - window, step):
         chunk = content[i:i + window]
         chunk_words = set(w.lower().strip('.,;:()[]') for w in chunk.split())
         score = len(claim_words & chunk_words)
         chunks.append((score, i, chunk))
-    
-    if not chunks:
-        return content[:max_chars]
-    
+
     # Sort by relevance score, take top chunks
     chunks.sort(key=lambda x: -x[0])
-    
-    # Collect top chunks until we hit max_chars, maintaining document order
-    selected = sorted(chunks[:8], key=lambda x: x[1])  # Sort by position
+
+    # Combine: top chunks (deduped against anchors by position) + anchors.
+    # Then sort by position to maintain document order.
+    selected_positions = set()
+    result_parts = []  # list of (position, text)
+
+    for score, pos, chunk in chunks[:top_chunks]:
+        if score >= 2 and pos not in selected_positions:
+            result_parts.append((pos, chunk))
+            selected_positions.add(pos)
+
+    for pos, anchor in anchors:
+        if pos not in selected_positions:
+            result_parts.append((pos, anchor))
+            selected_positions.add(pos)
+
+    result_parts.sort(key=lambda x: x[0])
     result = ""
-    for score, pos, chunk in selected:
-        if score >= 2:  # At least 2 keyword matches
-            if len(result) + len(chunk) + 10 > max_chars:
-                break
-            if result:
-                result += "\n...\n"
-            result += chunk
-    
-    # If nothing found with good scores, use beginning + any keyword-containing sections
-    if not result:
-        result = content[:2000]
-        # Also add any paragraph containing claim keywords
-        paragraphs = content.split('\n\n')
-        for para in paragraphs:
-            para_words = set(w.lower() for w in para.split())
-            if len(claim_words & para_words) >= 2 and para not in result:
-                if len(result) + len(para) < max_chars:
-                    result += f"\n...\n{para}"
-    
-    return result[:max_chars]
+    for pos, chunk in result_parts:
+        if len(result) + len(chunk) + 10 > max_chars:
+            break
+        if result:
+            result += "\n...\n"
+        result += chunk
+    return result
 
 
 def _search_backup_reference(claim_text: str, question: str, question_id: str, claim_idx: int, search_fn) -> 'ClaimVerification':
@@ -537,7 +584,7 @@ def _search_backup_reference(claim_text: str, question: str, question_id: str, c
                 claim_text=claim_text,
                 cited_refs=[],
                 verdict=final_verdict,
-                confidence=result.get("confidence", 0.5),
+                confidence=_clamp_confidence(result.get("confidence"), default=0.5),
                 evidence_quote=result.get("evidence_quote", ""),
                 evidence_reference=f"BACKUP: {title} ({url})",
                 evidence_span_start=-1,
@@ -565,14 +612,14 @@ def search_pubmed(query: str, max_results: int = 3) -> list:
     """
     Search PubMed for articles matching a query.
     Returns list of {"title": str, "content": str, "url": str}.
-    
+
     This is the default search_fn for backup reference finding.
     """
     import requests
-    
+
     # PubMed E-utilities search
     base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-    
+
     # Step 1: Search for article IDs
     search_url = f"{base_url}/esearch.fcgi"
     params = {
@@ -581,17 +628,17 @@ def search_pubmed(query: str, max_results: int = 3) -> list:
         "retmax": max_results,
         "retmode": "json",
     }
-    
+
     try:
         resp = requests.get(search_url, params=params, timeout=15)
         data = resp.json()
         ids = data.get("esearchresult", {}).get("idlist", [])
-    except:
+    except Exception:
         return []
-    
+
     if not ids:
         return []
-    
+
     # Step 2: Fetch abstracts for found articles
     fetch_url = f"{base_url}/efetch.fcgi"
     params = {
@@ -599,36 +646,52 @@ def search_pubmed(query: str, max_results: int = 3) -> list:
         "id": ",".join(ids),
         "retmode": "xml",
     }
-    
+
     try:
         resp = requests.get(fetch_url, params=params, timeout=15)
-        # Simple XML parsing for title + abstract
+        # M9 fix: use ElementTree to handle nested tags and CDATA
+        # correctly. The previous regex approach broke on PubMed XML
+        # where abstract sections can be split or have inner markup.
         import re
+        import xml.etree.ElementTree as ET
         results = []
-        articles = resp.text.split("<PubmedArticle>")[1:]
-        
-        for article_xml in articles[:max_results]:
-            title_match = re.search(r"<ArticleTitle>(.*?)</ArticleTitle>", article_xml, re.DOTALL)
-            abstract_match = re.search(r"<AbstractText.*?>(.*?)</AbstractText>", article_xml, re.DOTALL)
-            pmid_match = re.search(r"<PMID.*?>(.*?)</PMID>", article_xml)
-            
-            title = title_match.group(1).strip() if title_match else ""
-            abstract = abstract_match.group(1).strip() if abstract_match else ""
-            pmid = pmid_match.group(1).strip() if pmid_match else ""
-            
-            # Clean HTML tags
-            title = re.sub(r"<.*?>", "", title)
-            abstract = re.sub(r"<.*?>", "", abstract)
-            
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError:
+            # Fall back to a coarse split if the document is malformed
+            articles = resp.text.split("<PubmedArticle>")[1:]
+            for article_xml in articles[:max_results]:
+                title_m = re.search(r"<ArticleTitle>(.*?)</ArticleTitle>", article_xml, re.DOTALL)
+                abstract_m = re.search(r"<AbstractText.*?>(.*?)</AbstractText>", article_xml, re.DOTALL)
+                pmid_m = re.search(r"<PMID.*?>(.*?)</PMID>", article_xml)
+                title = re.sub(r"<.*?>", "", title_m.group(1).strip()) if title_m else ""
+                abstract = re.sub(r"<.*?>", "", abstract_m.group(1).strip()) if abstract_m else ""
+                pmid = pmid_m.group(1).strip() if pmid_m else ""
+                if title and abstract:
+                    results.append({
+                        "title": title,
+                        "content": abstract,
+                        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                    })
+            return results
+
+        for article in root.findall(".//PubmedArticle"):
+            title_el = article.find(".//ArticleTitle")
+            abstract_els = article.findall(".//AbstractText")
+            pmid_el = article.find(".//PMID")
+            title = "".join(title_el.itertext()).strip() if title_el is not None else ""
+            abstract = " ".join("".join(e.itertext()).strip() for e in abstract_els).strip()
+            pmid = "".join(pmid_el.itertext()).strip() if pmid_el is not None else ""
             if title and abstract:
                 results.append({
                     "title": title,
                     "content": abstract,
                     "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
                 })
-        
+            if len(results) >= max_results:
+                break
         return results
-    except:
+    except Exception:
         return []
 
 
@@ -732,7 +795,7 @@ def verify_single_claim(
     evidence_ref = str(cited_refs[0]) if cited_refs else ""
     span_start = -1
     span_end = -1
-    
+
     if evidence_quote and cited_refs:
         # Try to locate the quote in the source article
         ref_idx = cited_refs[0] - 1
@@ -751,6 +814,29 @@ def verify_single_claim(
                     if pos >= 0:
                         span_start = pos
                         span_end = pos + len(evidence_quote)
+                if pos < 0:
+                    # Final fallback: normalized whitespace match.
+                    # The LLM may have collapsed/different whitespace than
+                    # the source (e.g. the LLM returned "Hello world" and
+                    # the source has "Hello  world"). Normalize both and
+                    # search again.
+                    import re as _re
+                    def _norm_ws(s):
+                        return _re.sub(r"\s+", " ", s).strip()
+                    src_norm = _norm_ws(source_content)
+                    quote_norm = _norm_ws(evidence_quote[:50])
+                    if quote_norm:
+                        pos_norm = src_norm.find(quote_norm)
+                        if pos_norm >= 0:
+                            # Map back to the original source by finding the
+                            # normalized position in a pre-normalized mapping
+                            # of offsets. Approximate: search for the
+                            # first 10 chars of the quote in the original.
+                            head = quote_norm[:10]
+                            pos = source_content.find(head)
+                            if pos >= 0:
+                                span_start = pos
+                                span_end = pos + len(evidence_quote)
 
     return ClaimVerification(
         question_id=question_id,
@@ -758,7 +844,7 @@ def verify_single_claim(
         claim_text=claim_text,
         cited_refs=cited_refs,
         verdict=result.get("verdict", "UNVERIFIABLE"),
-        confidence=result.get("confidence", 0.0),
+        confidence=_clamp_confidence(result.get("confidence"), default=0.0),
         evidence_quote=evidence_quote,
         evidence_reference=evidence_ref,
         evidence_span_start=span_start,
@@ -768,15 +854,296 @@ def verify_single_claim(
     )
 
 
-def verify_citations_for_question(entry: dict, search_backup: bool = False, n_votes: int = 1, single_claim: bool = False) -> list:
+# Aggregation order for per-ref verdicts. Higher index = stronger claim support.
+# "Best ref wins": if any ref says SUPPORTED, the claim is at least partly supported.
+_PER_REF_AGGREGATION_ORDER = [
+    "UNVERIFIABLE",
+    "CONTRADICTED",
+    "NOT_SUPPORTED",
+    "PARTIALLY_SUPPORTED",
+    "SUPPORTED",
+]
+
+
+def verify_claim_per_ref(
+    claim: dict, articles: list, question: str, question_id: str, claim_idx: int,
+    search_backup: bool = False, search_fn=None, n_votes: int = 1
+) -> ClaimVerification:
+    """Verify one claim against each cited ref independently, then aggregate.
+
+    The root cause of the 55-62% website drop was a single-LLM-call design
+    that concatenated all cited sources into one source block, then asked
+    the LLM to verify the whole sentence at once. For a 5-ref claim
+    (e.g. "transformers [62,68] use self-attention; adapters [14,23] are
+    parameter-efficient; noise [26,27] is a regularizer"), the LLM would
+    see only one source's content covering ~1/5 of the sentence and
+    return PARTIALLY_SUPPORTED.
+
+    This function issues one LLM call per ref, then picks the strongest
+    verdict (any SUPPORTED ref promotes the claim; otherwise any
+    PARTIALLY; etc.). The returned ClaimVerification also has a
+    `per_ref_verdicts` attribute attached (list of dicts with ref_num,
+    verdict, confidence, evidence_quote, error) for callers that want
+    the per-ref breakdown.
+
+    Cost: N LLM calls per multi-ref claim vs 1 in the old path. Worth it;
+    this is the headline number the website reports.
+    """
+    cited_refs = claim.get("cited_refs", [])
+    claim_text = claim.get("claim_text", "")
+
+    if not cited_refs:
+        # No citations: fall through to the same uncited-claim path as
+        # verify_single_claim (search_backup or UNVERIFIABLE).
+        if search_backup and search_fn:
+            return _search_backup_reference(claim_text, question, question_id, claim_idx, search_fn)
+        return ClaimVerification(
+            question_id=question_id,
+            claim_id=f"{question_id}-C{claim_idx}",
+            claim_text=claim_text,
+            cited_refs=[],
+            verdict="UNVERIFIABLE",
+            confidence=0.5,
+            evidence_quote="",
+            evidence_reference="",
+            evidence_span_start=-1,
+            evidence_span_end=-1,
+            reasoning="No citation provided for this claim",
+        )
+
+    per_ref_verdicts = []
+    best_verdict = None
+    best_rank = -1
+    best_payload = None  # confidence/evidence/reasoning from the winning ref
+    chosen_ref = None
+
+    for ref_num in cited_refs:
+        idx = ref_num - 1
+        if not (0 <= idx < len(articles)):
+            per_ref_verdicts.append({
+                "ref_num": ref_num,
+                "verdict": "UNVERIFIABLE",
+                "confidence": 0.0,
+                "evidence_quote": "",
+                "reasoning": f"ref [{ref_num}] not in retrieved set",
+                "error": "missing",
+            })
+            continue
+
+        art = articles[idx]
+        content = art.get("content") or art.get("abstract") or art.get("summary") or ""
+        title = art.get("title", f"Article {ref_num}")
+        if not content or len(content.strip()) < 20:
+            per_ref_verdicts.append({
+                "ref_num": ref_num,
+                "verdict": "UNVERIFIABLE",
+                "confidence": 0.0,
+                "evidence_quote": "",
+                "reasoning": f"ref [{ref_num}] has no resolvable content",
+                "error": "no_content",
+            })
+            continue
+
+        # Build a single-ref source block and call the LLM
+        if len(content) <= 4000:
+            relevant = content
+        else:
+            relevant = _find_relevant_spans(claim_text, content)
+        source_block = f"[{ref_num}] {title}\n{relevant}"
+
+        # H1: NLI pre-filter (optional, default off). If enabled and the
+        # NLI model is confident (>= SHORT_CIRCUIT_*_THRESHOLD), skip the
+        # LLM call for this ref entirely. Saves cost and latency on
+        # high-confidence SUPPORTED/NOT_SUPPORTED verdicts.
+        nli_short_circuited = False
+        try:
+            import hve_nli
+            short = hve_nli.maybe_short_circuit(claim_text, source_block)
+            if short is not None:
+                verdict_label, conf, _eq = short
+                ref_verdict = verdict_label
+                ref_payload = {
+                    "verdict": verdict_label,
+                    "confidence": conf,
+                    "evidence_quote": "",
+                    "evidence_start_phrase": "",
+                    "reasoning": f"short-circuited by NLI pre-filter (confidence {conf:.2f})",
+                }
+                nli_short_circuited = True
+        except ImportError:
+            pass  # hve_nli not on path; skip
+
+        user_prompt = (
+            f"ORIGINAL QUESTION: {question}\n\n"
+            f"CLAIM ATTRIBUTED TO YOU: {claim_text}\n\n"
+            f"YOUR CONTENT:\n{source_block}"
+        ) if not nli_short_circuited else ""
+
+        if nli_short_circuited:
+            # Skip LLM call entirely; ref_verdict and ref_payload already set
+            passes = [ref_payload]
+        else:
+            # n_votes: majority over the votes for this single ref
+            passes = []
+            for _ in range(max(1, n_votes)):
+                raw = llm_call(
+                    CITATION_VERIFICATION_PROMPT,
+                    user_prompt,
+                    response_format={"type": "json_object"},
+                )
+                try:
+                    passes.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    passes.append({
+                        "verdict": "UNVERIFIABLE",
+                        "confidence": 0.0,
+                        "evidence_quote": "",
+                        "evidence_start_phrase": "",
+                        "reasoning": "Failed to parse verification response",
+                    })
+
+            if n_votes > 1:
+                vote_counts = Counter(p.get("verdict", "UNVERIFIABLE") for p in passes)
+                ref_verdict = vote_counts.most_common(1)[0][0]
+                ref_payload = next(p for p, v in zip(passes, [pp.get("verdict", "UNVERIFIABLE") for pp in passes]) if v == ref_verdict)
+            else:
+                ref_verdict = passes[0].get("verdict", "UNVERIFIABLE")
+                ref_payload = passes[0]
+
+        ref_confidence = float(ref_payload.get("confidence", 0.0))
+        per_ref_verdicts.append({
+            "ref_num": ref_num,
+            "verdict": ref_verdict,
+            "confidence": ref_confidence,
+            "evidence_quote": ref_payload.get("evidence_quote", ""),
+            "reasoning": ref_payload.get("reasoning", ""),
+        })
+
+        # Aggregate: take the strongest verdict
+        rank = _PER_REF_AGGREGATION_ORDER.index(ref_verdict) if ref_verdict in _PER_REF_AGGREGATION_ORDER else -1
+        if rank > best_rank:
+            best_rank = rank
+            best_verdict = ref_verdict
+            best_payload = ref_payload
+            chosen_ref = ref_num
+
+    if best_verdict is None:
+        # No ref had any content at all. Dispatch to search-backup if enabled.
+        if search_backup:
+            fn = search_fn if search_fn is not None else search_pubmed
+            result = _search_backup_reference(claim_text, question, question_id, claim_idx, fn)
+            setattr(result, "per_ref_verdicts", per_ref_verdicts)
+            return result
+        return ClaimVerification(
+            question_id=question_id,
+            claim_id=f"{question_id}-C{claim_idx}",
+            claim_text=claim_text,
+            cited_refs=cited_refs,
+            verdict="UNVERIFIABLE",
+            confidence=0.0,
+            evidence_quote="",
+            evidence_reference="",
+            evidence_span_start=-1,
+            evidence_span_end=-1,
+            reasoning="No cited source had resolvable content",
+        )
+
+    # If every accessible ref returned UNVERIFIABLE and search-backup is enabled,
+    # try to find backup evidence rather than reporting the claim as unverifiable.
+    # This is Dennis's 6 Aug directive ("HallucinationNerd would find hallucinations
+    # when references are given and provide references for unverifiable statements").
+    # Only dispatch when at least one ref was accessible (otherwise we already
+    # dispatched above) AND every accessible ref came back UNVERIFIABLE.
+    accessible_refs = [e for e in per_ref_verdicts if e.get("error") is None]
+    all_unverifiable = (
+        best_verdict == "UNVERIFIABLE"
+        and len(accessible_refs) > 0
+        and all(e["verdict"] == "UNVERIFIABLE" for e in accessible_refs)
+    )
+    if all_unverifiable and search_backup:
+        fn = search_fn if search_fn is not None else search_pubmed
+        result = _search_backup_reference(claim_text, question, question_id, claim_idx, fn)
+        setattr(result, "per_ref_verdicts", per_ref_verdicts)
+        return result
+
+    evidence_quote = best_payload.get("evidence_quote", "")
+    evidence_ref = str(chosen_ref) if chosen_ref is not None else ""
+
+    # Compute span offset in the chosen source (best-effort). C10 fix:
+    # fallback chain is now (1) exact prefix match, (2) start-phrase match,
+    # (3) normalized-whitespace match.
+    span_start = -1
+    span_end = -1
+    if evidence_quote and chosen_ref is not None and 0 <= (chosen_ref - 1) < len(articles):
+        ref_idx = chosen_ref - 1
+        source_content = articles[ref_idx].get("content") or articles[ref_idx].get("abstract") or ""
+        if source_content:
+            pos = source_content.find(evidence_quote[:50])
+            if pos >= 0:
+                span_start = pos
+                span_end = pos + len(evidence_quote)
+            else:
+                start_phrase = best_payload.get("evidence_start_phrase", "")
+                if start_phrase:
+                    pos = source_content.find(start_phrase)
+                    if pos >= 0:
+                        span_start = pos
+                        span_end = pos + len(evidence_quote)
+                if pos < 0:
+                    # Normalized-whitespace fallback
+                    import re as _re
+                    def _norm_ws(s):
+                        return _re.sub(r"\s+", " ", s).strip()
+                    src_norm = _norm_ws(source_content)
+                    quote_norm = _norm_ws(evidence_quote[:50])
+                    if quote_norm:
+                        pos_norm = src_norm.find(quote_norm)
+                        if pos_norm >= 0:
+                            head = quote_norm[:10]
+                            pos = source_content.find(head)
+                            if pos >= 0:
+                                span_start = pos
+                                span_end = pos + len(evidence_quote)
+
+    result = ClaimVerification(
+        question_id=question_id,
+        claim_id=f"{question_id}-C{claim_idx}",
+        claim_text=claim_text,
+        cited_refs=cited_refs,
+        verdict=best_verdict,
+        confidence=_clamp_confidence(best_payload.get("confidence"), default=0.0),
+        evidence_quote=evidence_quote,
+        evidence_reference=evidence_ref,
+        evidence_span_start=span_start,
+        evidence_span_end=span_end,
+        reasoning=(
+            f"Per-ref verification: {len(per_ref_verdicts)} ref(s) evaluated; "
+            f"strongest ref [{chosen_ref}] returned {best_verdict}. "
+            + best_payload.get("reasoning", "")
+        ),
+    )
+    # Attach the per-ref breakdown as a non-standard attribute for callers
+    # that want the full picture. Dataclass allows this.
+    setattr(result, "per_ref_verdicts", per_ref_verdicts)
+    return result
+
+
+def verify_citations_for_question(entry: dict, search_backup: bool = False, n_votes: int = 1, single_claim: bool = False, per_ref: bool = False) -> list:
     """Run full citation verification for one Q&A entry.
-    
+
     If single_claim=True, the entire synopsis is treated as one atomic claim
     (citation numbers extracted deterministically via regex) instead of being
     passed through decompose_claims(). Use this when the input is already
     pre-atomized (one claim, one citation per entry) — e.g. benchmark datasets
     built from Related Work clauses — to avoid an unnecessary, non-deterministic
     LLM-based splitting pass that changes the unit of evaluation.
+
+    If per_ref=True, each cited ref is verified independently and the
+    verdicts are aggregated (any SUPPORTED ref promotes the claim).
+    This is the correct behavior for multi-ref claims. The benchmark
+    path uses per_ref=False for backward compatibility (the pre-paired
+    benchmark only has 1 ref per claim, so the per-ref vs. single-call
+    distinction is moot); the website path uses per_ref=True.
     """
     question_id = entry.get("question_id", "UNKNOWN")
     question = entry.get("question", "")
@@ -805,12 +1172,20 @@ def verify_citations_for_question(entry: dict, search_backup: bool = False, n_vo
 
     results = []
     for i, claim in enumerate(claims, 1):
-        result = verify_single_claim(
-            claim, articles, question, question_id, i,
-            search_backup=search_backup,
-            search_fn=search_pubmed if search_backup else None,
-            n_votes=n_votes,
-        )
+        if per_ref:
+            result = verify_claim_per_ref(
+                claim, articles, question, question_id, i,
+                search_backup=search_backup,
+                search_fn=search_pubmed if search_backup else None,
+                n_votes=n_votes,
+            )
+        else:
+            result = verify_single_claim(
+                claim, articles, question, question_id, i,
+                search_backup=search_backup,
+                search_fn=search_pubmed if search_backup else None,
+                n_votes=n_votes,
+            )
         results.append(result)
 
     return results
@@ -926,6 +1301,7 @@ def verify_article_evaluation(
             generated_value=str(value)[:500],
             verdict=result.get("verdict", "UNVERIFIABLE"),
             severity=result.get("severity", "MINOR"),
+            confidence=_clamp_confidence(result.get("confidence"), default=0.0),
             reasoning=result.get("reasoning", ""),
         ))
 
@@ -956,6 +1332,7 @@ def verify_article_evaluation(
             generated_value=summary[:500],
             verdict=result.get("verdict", "UNVERIFIABLE"),
             severity=result.get("severity", "MINOR"),
+            confidence=_clamp_confidence(result.get("confidence"), default=0.0),
             reasoning=result.get("reasoning", ""),
         ))
 
@@ -1046,7 +1423,7 @@ def compute_eval_metrics(results: list) -> dict:
 
 # ─── Main Pipeline ──────────────────────────────────────────────────────────
 
-def run_citation_verification(data: list, output_dir: Path, search_backup: bool = False, n_votes: int = 1, single_claim: bool = False) -> dict:
+def run_citation_verification(data: list, output_dir: Path, search_backup: bool = False, n_votes: int = 1, single_claim: bool = False, per_ref: bool = False) -> dict:
     """Run citation verification across all questions."""
     print(f"\n{'='*60}")
     print("TASK 1: CITATION ACCURACY VERIFICATION")
@@ -1056,6 +1433,8 @@ def run_citation_verification(data: list, output_dir: Path, search_backup: bool 
         print(f"  [STABLE MODE] {n_votes}-vote majority per claim (controls for LLM non-determinism)")
     if single_claim:
         print("  [SINGLE-CLAIM MODE] Treating each entry's synopsis as one atomic claim (no decomposition)")
+    if per_ref:
+        print("  [PER-REF MODE] Verifying each cited ref independently (correct for multi-ref claims)")
     print(f"{'='*60}")
     print(f"Processing {len(data)} questions...")
 
@@ -1065,7 +1444,7 @@ def run_citation_verification(data: list, output_dir: Path, search_backup: bool 
     for i, entry in enumerate(data, 1):
         qid = entry.get("question_id", f"Q{i}")
         print(f"\n[{i}/{len(data)}] Question: {qid}")
-        results = verify_citations_for_question(entry, search_backup=search_backup, n_votes=n_votes, single_claim=single_claim)
+        results = verify_citations_for_question(entry, search_backup=search_backup, n_votes=n_votes, single_claim=single_claim, per_ref=per_ref)
         all_results.extend(results)
         per_question[qid] = compute_citation_metrics(results)
 
@@ -1091,6 +1470,16 @@ def run_evaluation_verification(data: list, output_dir: Path) -> dict:
     print("TASK 2: ARTICLE EVALUATION ACCURACY VERIFICATION")
     print(f"{'='*60}")
     print(f"Processing {len(data)} questions...")
+
+    # M2: skip eval task entirely if the dataset has nothing evaluatable
+    has_eval = any(
+        (a.get("summary") or a.get("structured_extraction"))
+        for entry in data
+        for a in entry.get("retrieved_articles", entry.get("citations_obj", []))
+    )
+    if not has_eval:
+        print("  [SKIP] No 'summary' or 'structured_extraction' fields in dataset; nothing to evaluate.")
+        return {"total_evaluations": 0, "accuracy_rate": 0.0, "by_verdict": {}, "by_severity": {}}
 
     all_results = []
 
@@ -1127,6 +1516,8 @@ def write_summary_report(citation_metrics: dict, eval_metrics: dict, output_dir:
     report = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "model_used": CONFIG["model"],
+        "strictness": CONFIG.get("strictness", "lenient"),
+        "rate_limit_delay": CONFIG.get("rate_limit_delay", 1.0),
         "citation_verification": citation_metrics,
         "evaluation_verification": eval_metrics,
     }
@@ -1277,6 +1668,13 @@ def main():
              "one citation per entry) — this is the mode used to produce the paper's reported numbers."
     )
     parser.add_argument(
+        "--per-ref", action="store_true",
+        help="Verify each cited ref independently and aggregate verdicts (any SUPPORTED ref "
+             "promotes the claim). This is the correct mode for multi-ref claims. The benchmark "
+             "path uses single-call (default) for backward compatibility with the published "
+             "numbers; the website uses per-ref."
+    )
+    parser.add_argument(
         "--strictness", choices=["lenient", "strict"], default="lenient",
         help="Strictness dial for flagging hallucinations. 'lenient' (default) flags only clear "
              "non-support (NOT_SUPPORTED/CONTRADICTED) — favors precision. 'strict' also flags "
@@ -1319,7 +1717,7 @@ def main():
     eval_metrics = {}
 
     if args.task in ("citation", "both"):
-        citation_metrics = run_citation_verification(data, output_dir, search_backup=args.search_backup, n_votes=n_votes, single_claim=args.single_claim)
+        citation_metrics = run_citation_verification(data, output_dir, search_backup=args.search_backup, n_votes=n_votes, single_claim=args.single_claim, per_ref=args.per_ref)
 
     if args.task in ("evaluation", "both"):
         eval_metrics = run_evaluation_verification(data, output_dir)

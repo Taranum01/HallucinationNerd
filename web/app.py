@@ -23,6 +23,30 @@ load_dotenv()
 # The verification engine files (verify_hallucinations.py, arxiv_extractor.py)
 # are co-located in this directory for deployment.
 
+# M19: per-IP rate limiting on /verify. Default: 5 requests per 60s.
+# Override with HVE_RATE_LIMIT_REQUESTS and HVE_RATE_LIMIT_WINDOW_SECONDS.
+# Uses a simple in-memory token bucket — single-process only. For
+# multi-worker deployments, swap in a Redis-backed limiter.
+import time as _time
+_rate_limit_requests = int(os.getenv("HVE_RATE_LIMIT_REQUESTS", "5"))
+_rate_limit_window = int(os.getenv("HVE_RATE_LIMIT_WINDOW_SECONDS", "60"))
+_rate_buckets: dict = {}  # ip -> [timestamps]
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Returns True if the request is allowed, False if rate-limited."""
+    now = _time.time()
+    bucket = _rate_buckets.get(ip, [])
+    # Drop timestamps outside the window
+    bucket = [t for t in bucket if now - t < _rate_limit_window]
+    if len(bucket) >= _rate_limit_requests:
+        _rate_buckets[ip] = bucket
+        return False
+    bucket.append(now)
+    _rate_buckets[ip] = bucket
+    return True
+
+
 app = FastAPI(title="HallucinationNerd", description="Citation Hallucination Verification")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -52,8 +76,23 @@ async def verify_document(
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="Server misconfigured: no API key")
 
-    # Read uploaded file
+    # M19: per-IP rate limit. Reject with 429 if the caller has burned
+    # through their budget in the current window.
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: max {_rate_limit_requests} requests per {_rate_limit_window}s. Try again later.",
+        )
+
+    # L24: enforce a max upload size to prevent abuse. Default 25 MB.
+    max_bytes = int(os.getenv("HVE_MAX_UPLOAD_BYTES", "26214400"))
     content_bytes = await file.read()
+    if len(content_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(content_bytes)} bytes; max {max_bytes})",
+        )
     filename = file.filename or "uploaded_file"
     suffix = Path(filename).suffix.lower()
 
@@ -162,50 +201,12 @@ def _extract_citation_rich_sections(text: str, max_chars: int = 12000) -> str:
     return text[:max_chars]
 
 
-def _verify_one(claim_text: str, source_content: str) -> dict:
-    """Verify a single claim against a block of source content (used by the backup
-    search for uncited claims). Returns a dict with verdict/confidence/evidence."""
-    import re as _re
-    import hashlib as _hl
-    from verify_hallucinations import verify_citations_for_question, _find_relevant_spans
-
-    clean_text = _re.sub(r'\[\d+(?:,\s*\d+)*\]', '', claim_text).strip()
-    chunked = _find_relevant_spans(clean_text, source_content)
-    if not chunked or len(chunked) < 50:
-        chunked = source_content[:15000]
-
-    out = {"verdict": "UNVERIFIABLE", "confidence": 0.0, "evidence_quote": "", "reasoning": ""}
-    verification = verify_citations_for_question(
-        entry={
-            "question_id": _hl.md5((clean_text + "backup").encode()).hexdigest()[:12],
-            "synopsis": f"{clean_text} [1]",
-            "retrieved_articles": [{"id": "1", "content": chunked}],
-        },
-        single_claim=True,
-    )
-    if verification:
-        v = verification[0] if isinstance(verification, list) else verification
-        if hasattr(v, "verdict"):
-            out.update({"verdict": v.verdict, "confidence": v.confidence,
-                        "evidence_quote": v.evidence_quote, "reasoning": v.reasoning})
-        else:
-            out.update({"verdict": v.get("verdict", "UNVERIFIABLE"),
-                        "confidence": v.get("confidence", 0.0),
-                        "evidence_quote": v.get("evidence_quote", ""),
-                        "reasoning": v.get("reasoning", "")})
-    return out
-
-
 def _run_verification(file_path: str, filename: str, suffix: str, source_type: str,
                       databases: list = None, custom_database: str = "") -> dict:
     """
     Run the HallucinationNerd pipeline on the uploaded file.
     This runs in a thread to not block the event loop.
-    `databases` is the list of user-selected backup-search databases (used for
-    claims with no inline citation); `custom_database` is an optional user-supplied
-    search-URL template.
     """
-    databases = databases or []
     from verify_hallucinations import (
         _parse_pdf,
         decompose_claims,
@@ -274,126 +275,141 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
     if all_cited:
         resolved_sources = resolve_and_fetch_all(text, list(all_cited))
 
-    # Step 3: Verify each claim against its resolved source(s)
+    # Step 3: Verify each claim using per-ref verification (C1 fix)
+    # The old code picked the first accessible ref and verified the whole
+    # sentence against it, which produced PARTIALLY_SUPPORTED for multi-ref
+    # claims. The new code verifies each ref independently and aggregates.
+    from verify_hallucinations import verify_claim_per_ref, _find_relevant_spans
+
     results = []
+    databases = databases or []
     for claim_data in claims:
         claim_text = claim_data.get("claim_text", claim_data.get("claim", ""))
         cited_refs = claim_data.get("cited_refs", [])
 
-        result = {
-            "claim": claim_text,
-            "cited_refs": cited_refs,
-            "verdict": "UNVERIFIABLE",
-            "confidence": 0.0,
-            "evidence_quote": "",
-            "reasoning": "",
-            "citation_exists": None,
-        }
-
         if not cited_refs:
-            # No inline citation. If the user enabled backup databases, search them
-            # for supporting evidence; otherwise report it as uncited.
+            # No inline citation. If the user enabled backup databases, search
+            # them for supporting evidence; otherwise report it as uncited.
             if databases or custom_database:
                 from citation_resolver import backup_search
                 bcontent, bsource = backup_search(claim_text, databases, custom_database)
                 if bcontent:
-                    bv = _verify_one(claim_text, bcontent)
-                    if bv["verdict"] in ("SUPPORTED", "PARTIALLY_SUPPORTED"):
-                        result["verdict"] = "BACKUP_FOUND"
-                        result["backup_source"] = bsource
-                        result["confidence"] = bv["confidence"]
-                        result["evidence_quote"] = bv["evidence_quote"]
-                        result["reasoning"] = (
-                            f"No inline citation. Supporting evidence found via {bsource} "
-                            f"(verdict against that source: {bv['verdict']})."
-                        )
-                    else:
-                        result["verdict"] = "NO_BACKUP_FOUND"
-                        result["backup_source"] = bsource
-                        result["reasoning"] = (
-                            f"No inline citation. Searched {bsource}, but the top candidate "
-                            f"did not support the claim ({bv['verdict']})."
-                        )
-                else:
-                    result["verdict"] = "NO_BACKUP_FOUND"
-                    searched = ", ".join(databases) if databases else "custom database"
-                    result["reasoning"] = (
-                        f"No inline citation. No supporting source found in the selected "
-                        f"database(s): {searched}."
+                    chunked = _find_relevant_spans(claim_text, bcontent)
+                    if not chunked or len(chunked) < 50:
+                        chunked = bcontent[:15000]
+                    bv = verify_claim_per_ref(
+                        claim={"claim_text": claim_text, "cited_refs": []},
+                        articles=[{"id": "1", "content": chunked}],
+                        question="",
+                        question_id=hashlib.md5((claim_text + "backup").encode()).hexdigest()[:12],
+                        claim_idx=1,
+                        search_backup=False,
                     )
+                    if bv.verdict in ("SUPPORTED", "PARTIALLY_SUPPORTED"):
+                        results.append({
+                            "claim": claim_text, "cited_refs": cited_refs,
+                            "verdict": "BACKUP_FOUND", "confidence": bv.confidence,
+                            "evidence_quote": bv.evidence_quote,
+                            "reasoning": f"No inline citation. Supporting evidence found via {bsource} (verdict against that source: {bv.verdict}).",
+                            "citation_exists": None, "per_ref_verdicts": [], "backup_source": bsource,
+                        })
+                    else:
+                        results.append({
+                            "claim": claim_text, "cited_refs": cited_refs,
+                            "verdict": "NO_BACKUP_FOUND", "confidence": 0.0, "evidence_quote": "",
+                            "reasoning": f"No inline citation. Searched {bsource}, but the top candidate did not support the claim ({bv.verdict}).",
+                            "citation_exists": None, "per_ref_verdicts": [], "backup_source": bsource,
+                        })
+                else:
+                    searched = ", ".join(databases) if databases else "custom database"
+                    results.append({
+                        "claim": claim_text, "cited_refs": cited_refs,
+                        "verdict": "NO_BACKUP_FOUND", "confidence": 0.0, "evidence_quote": "",
+                        "reasoning": f"No inline citation. No supporting source found in the selected database(s): {searched}.",
+                        "citation_exists": None, "per_ref_verdicts": [],
+                    })
             else:
-                result["reasoning"] = "No citation provided for this claim."
-            results.append(result)
+                results.append({
+                    "claim": claim_text,
+                    "cited_refs": cited_refs,
+                    "verdict": "UNVERIFIABLE",
+                    "confidence": 0.0,
+                    "evidence_quote": "",
+                    "reasoning": "No citation provided for this claim.",
+                    "citation_exists": None,
+                    "per_ref_verdicts": [],
+                })
             continue
 
-        # Try ALL cited refs until we find one we can access (not just the first)
-        source_content = None
-        ref_key = None
+        # Build the articles list (positional [N] -> articles[N-1]) for the engine.
+        # Each cited ref becomes one article. Unresolvable refs are tracked
+        # separately so the response can surface them.
+        articles = []
+        resolved_ref_keys = []
+        unresolved_refs = []
         for ref in cited_refs:
             rk = str(ref)
             content = resolved_sources.get(rk)
-            if content and len(content) > 100:
-                source_content = content
-                ref_key = rk
-                break
-
-        if not source_content:
-            result["reasoning"] = f"Could not access any source for references [{', '.join(str(r) for r in cited_refs)}]. The cited sources may be behind a paywall, unavailable, or could not be resolved."
-            result["citation_exists"] = False
-            results.append(result)
-            continue
-
-        # We have source content — verify the claim against it
-        result["citation_exists"] = True
-
-        # For claims with many refs, extract just the clause relevant to the ref we're checking
-        # This makes verification more precise (full sentence might cover multiple papers)
-        verification_text = claim_text
-        if len(cited_refs) > 3:
-            # Try to extract the specific clause near this ref's mention
-            clause = _extract_clause_for_ref(claim_text, ref_key)
-            if clause:
-                verification_text = clause
-
-        # The verification engine uses positional indexing (ref [1] = articles[0]).
-        # Strip original citation markers and map to [1] since we provide exactly one article.
-        # Use keyword-overlap chunking to find the relevant passage (same as benchmark)
-        import re as _re
-        from verify_hallucinations import _find_relevant_spans
-        clean_text = _re.sub(r'\[\d+(?:,\s*\d+)*\]', '', verification_text).strip()
-        
-        # Chunk the source to the most relevant passage (same technique as benchmark)
-        chunked_content = _find_relevant_spans(clean_text, source_content)
-        if not chunked_content or len(chunked_content) < 50:
-            chunked_content = source_content[:15000]
-        
-        synopsis_with_ref = f"{clean_text} [1]"
-        verification = verify_citations_for_question(
-            entry={
-                "question_id": hashlib.md5(claim_text.encode()).hexdigest()[:12],
-                "synopsis": synopsis_with_ref,
-                "retrieved_articles": [{"id": "1", "content": chunked_content}],
-            },
-            single_claim=True,
-        )
-        if verification:
-            v = verification[0] if isinstance(verification, list) else verification
-            if hasattr(v, 'verdict'):
-                result.update({
-                    "verdict": v.verdict,
-                    "confidence": v.confidence,
-                    "evidence_quote": v.evidence_quote,
-                    "reasoning": v.reasoning,
-                })
+            if content and len(content.strip()) > 20:
+                # Chunk the source content with keyword-overlap so the LLM sees
+                # the most relevant spans, not the whole (potentially 50K-char) source.
+                chunked = _find_relevant_spans(claim_text, content)
+                if not chunked or len(chunked) < 50:
+                    chunked = content[:15000]
+                articles.append({"id": rk, "content": chunked})
+                resolved_ref_keys.append(ref)
             else:
-                result.update({
-                    "verdict": v.get("verdict", "UNVERIFIABLE"),
-                    "confidence": v.get("confidence", 0.0),
-                    "evidence_quote": v.get("evidence_quote", ""),
-                    "reasoning": v.get("reasoning", ""),
-                })
+                unresolved_refs.append(ref)
 
-        results.append(result)
+        # Per-ref verification: one LLM call per ref, aggregate strongest.
+        # search_backup=True makes the engine dispatch to PubMed for cited-but-
+        # paywalled refs and for refs whose content is otherwise unverifiable
+        # (Dennis's 6 Aug directive: "HVE would find hallucinations when
+        # references are given and provide references for unverifiable
+        # statements").
+        verification = verify_claim_per_ref(
+            claim={"claim_text": claim_text, "cited_refs": cited_refs},
+            articles=articles,
+            question="",  # website path doesn't have an original question
+            question_id=hashlib.md5(claim_text.encode()).hexdigest()[:12],
+            claim_idx=1,
+            search_backup=True,
+        )
+        per_ref = getattr(verification, "per_ref_verdicts", [])
+
+        # Map per-ref verdicts back to the original ref numbers (resolved_ref_keys
+        # are 1-indexed, articles are 0-indexed; we just translate the article idx
+        # to the original ref num).
+        ref_idx_to_num = {i + 1: resolved_ref_keys[i] for i in range(len(resolved_ref_keys))}
+        for entry in per_ref:
+            if entry.get("ref_num") in (None, 0):
+                entry["ref_num"] = ref_idx_to_num.get(entry.get("ref_num"), entry.get("ref_num"))
+
+        # When no ref resolved at all, surface the unresolved_refs list and
+        # indicate the citation couldn't be reached. The engine has already
+        # dispatched to search-backup if the verdict is BACKUP_FOUND/NO_BACKUP_FOUND.
+        if not articles and unresolved_refs:
+            unresolved_list = ", ".join(str(r) for r in unresolved_refs)
+            note = (
+                f"Could not access any source for references [{unresolved_list}]. "
+                f"The cited sources may be behind a paywall, unavailable, or could not be resolved."
+            )
+            reasoning = f"{verification.reasoning}\n{note}" if verification.verdict in ("BACKUP_FOUND", "BACKUP_PARTIAL", "NO_BACKUP_FOUND") else note
+        else:
+            reasoning = verification.reasoning
+
+        results.append({
+            "claim": claim_text,
+            "cited_refs": cited_refs,
+            "verdict": verification.verdict,
+            "confidence": verification.confidence,
+            "evidence_quote": verification.evidence_quote,
+            "evidence_reference": verification.evidence_reference,
+            "reasoning": reasoning,
+            "citation_exists": bool(articles),
+            "unresolved_refs": unresolved_refs,
+            "per_ref_verdicts": per_ref,
+        })
 
     # Step 4: Compute summary
     total = len(results)
@@ -405,9 +421,13 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
     backup_found = sum(1 for r in results if r["verdict"] == "BACKUP_FOUND")
     no_backup_found = sum(1 for r in results if r["verdict"] == "NO_BACKUP_FOUND")
 
-    # Verifiable = everything we could actually assess (backup outcomes count).
-    verifiable = supported + partial + not_supported + contradicted + backup_found + no_backup_found
+    verifiable = total - unverifiable
     reliability_pct = (supported + partial + backup_found) / verifiable * 100 if verifiable > 0 else 0
+    # H5 fix: also expose the supported-only precision. PARTIALLY is
+    # ambiguous (the claim is only partially supported by the cited source),
+    # so reporting (supported + partial) as "reliability" overstates
+    # confidence. The UI should show both.
+    precision_pct = supported / verifiable * 100 if verifiable > 0 else 0
 
     return {
         "filename": filename,
@@ -420,7 +440,10 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
             "unverifiable": unverifiable,
             "backup_found": backup_found,
             "no_backup_found": no_backup_found,
-            "reliability_percent": round(reliability_pct, 1),
+            "reliability_percent": round(reliability_pct, 1),  # includes PARTIALLY
+            "reliability_percent_full": round(reliability_pct, 6),  # L14: full precision for export
+            "precision_percent": round(precision_pct, 1),  # SUPPORTED only
+            "precision_percent_full": round(precision_pct, 6),
         },
         "claims": results,
     }
@@ -476,6 +499,7 @@ def _verify_structured_input(data: list) -> dict:
 
     verifiable = total - unverifiable
     reliability_pct = (supported + partial) / verifiable * 100 if verifiable > 0 else 0
+    precision_pct = supported / verifiable * 100 if verifiable > 0 else 0
 
     return {
         "filename": "structured_input.json",
@@ -486,7 +510,10 @@ def _verify_structured_input(data: list) -> dict:
             "not_supported": not_supported,
             "contradicted": contradicted,
             "unverifiable": unverifiable,
-            "reliability_percent": round(reliability_pct, 1),
+            "reliability_percent": round(reliability_pct, 1),  # includes PARTIALLY
+            "reliability_percent_full": round(reliability_pct, 6),  # L14: full precision
+            "precision_percent": round(precision_pct, 1),  # SUPPORTED only
+            "precision_percent_full": round(precision_pct, 6),
         },
         "claims": all_results,
     }
@@ -494,4 +521,8 @@ def _verify_structured_input(data: list) -> dict:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    # M18: default to localhost for safety. Set HOST=0.0.0.0 to expose
+    # publicly (e.g., behind a reverse proxy).
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host=host, port=port)

@@ -25,8 +25,12 @@ _MIN_REQUEST_INTERVAL = 0.3  # Faster with API key (100/sec allowed)
 # Semantic Scholar API key (free, 100 req/sec vs 1 req/sec without)
 _S2_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
 
-# Simple in-memory cache for resolved sources
-_source_cache = {}
+# Simple in-memory cache for resolved sources. Entries expire after
+# `_CACHE_TTL_SECONDS` so stale arXiv versions and rate-limited Unpaywall
+# responses don't stick forever.
+import time as _time
+_source_cache: dict = {}  # cache_key -> (timestamp, content)
+_CACHE_TTL_SECONDS = 3600  # 1 hour default; override with HVE_CACHE_TTL
 
 
 def _rate_limit():
@@ -258,7 +262,7 @@ def _fetch_doi(doi: str) -> Optional[str]:
     # Try Unpaywall first (finds free/open-access versions)
     _rate_limit()
     try:
-        unpaywall_url = f"https://api.unpaywall.org/v2/{doi}?email=hallucinationnerd@example.com"
+        unpaywall_url = f"https://api.unpaywall.org/v2/{doi}?email={os.getenv('UNPAYWALL_EMAIL', 'hallucinationnerd@example.com')}"
         resp = requests.get(unpaywall_url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
@@ -476,6 +480,32 @@ def _search_semantic_scholar(query: str) -> Optional[str]:
     return None
 
 
+def _make_cache_key(ref_info: dict, ref_key: str) -> str:
+    """Stable cache key for a parsed reference.
+
+    The previous key (first 100 chars of `raw` text) caused collisions
+    whenever two references had the same opening — common for repeated
+    author names, long titles getting truncated the same way, etc.
+
+    New key: prefer canonical identifiers (arxiv_id > doi > pmid > title).
+    Falls back to a hash of (title + arxiv_id + doi) for the long tail.
+    """
+    arxiv = (ref_info.get("arxiv_id") or "").strip().lower()
+    if arxiv:
+        return f"arxiv:{arxiv}"
+    doi = (ref_info.get("doi") or "").strip().lower()
+    if doi:
+        return f"doi:{doi}"
+    pmid = (ref_info.get("pmid") or "").strip()
+    if pmid:
+        return f"pmid:{pmid}"
+    title = (ref_info.get("title") or ref_info.get("raw") or ref_key).strip().lower()
+    if title:
+        import hashlib
+        return "title:" + hashlib.sha256(title.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"raw:{ref_key}"
+
+
 def _search_pubmed(query: str) -> Optional[str]:
     """Search PubMed by query and return the top hit's abstract (backup search)."""
     _rate_limit()
@@ -493,15 +523,13 @@ def _search_pubmed(query: str) -> Optional[str]:
         return None
 
 
-# User-selectable backup-search databases (the professor's checkbox request).
-# Order in the UI: PubMed, arXiv, Semantic Scholar.
+# User-selectable backup-search databases (source-database checkboxes in the web UI).
 _DB_SEARCHERS = {
     "pubmed": ("PubMed", _search_pubmed),
     "arxiv": ("arXiv", _search_arxiv_by_title),
     "semantic_scholar": ("Semantic Scholar", _search_semantic_scholar),
 }
 
-# Databases searched when the caller enables backup search but names none explicitly.
 DEFAULT_BACKUP_DATABASES = ["pubmed", "arxiv", "semantic_scholar"]
 
 
@@ -510,12 +538,10 @@ def backup_search(query: str, databases: list, custom_url_template: str = ""):
     Backup reference search for a claim that carries NO inline citation.
 
     Searches only the user-selected `databases` (keys from _DB_SEARCHERS), in the
-    order given, and optionally a user-supplied database via a search-URL template
-    containing the literal '{query}'. This is what backs the source-database
-    checkboxes in the web UI ("let the user pick / add databases").
-
-    Returns (content, source_label) for the first database that yields usable
-    content, else (None, None).
+    order given, plus an optional user-supplied database via a search-URL template
+    containing the literal '{query}'. Backs the source-database checkboxes in the
+    web UI. Returns (content, source_label) for the first database that yields
+    usable content, else (None, None).
     """
     for db in databases:
         key = str(db).strip().lower().replace(" ", "_").replace("-", "_")
@@ -530,7 +556,6 @@ def backup_search(query: str, databases: list, custom_url_template: str = ""):
         if content and len(content) > 100:
             return content, label
 
-    # Optional user-supplied database: a search-URL template with a {query} slot.
     if custom_url_template and "{query}" in custom_url_template:
         import urllib.parse
         url = custom_url_template.replace("{query}", urllib.parse.quote(query[:200]))
@@ -546,7 +571,7 @@ def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
     Main entry point: given full document text and a list of citation markers
     (e.g., ["1", "2"]), resolve each to actual content.
     Uses parallel fetching for speed (5 concurrent downloads).
-    
+
     Returns: {"1": "content text...", "2": None, ...}
     """
     # Parse references section
@@ -555,12 +580,20 @@ def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
     # Check cache first, build list of refs that need fetching
     results = {}
     to_fetch = []
+    ttl = int(os.getenv("HVE_CACHE_TTL", str(_CACHE_TTL_SECONDS)))
+    now = _time.time()
+    # Garbage-collect expired entries
+    for k in [k for k, v in _source_cache.items() if now - v[0] > ttl]:
+        _source_cache.pop(k, None)
+
     for ref_key in cited_refs:
         ref_key_str = str(ref_key)
-        # Check cache
-        cache_key = refs.get(ref_key_str, {}).get("raw", ref_key_str)[:100]
-        if cache_key in _source_cache:
-            results[ref_key_str] = _source_cache[cache_key]
+        ref_info = refs.get(ref_key_str, {})
+        cache_key = _make_cache_key(ref_info, ref_key_str)
+        cached = _source_cache.get(cache_key)
+        if cached is not None:
+            _, content = cached
+            results[ref_key_str] = content
         elif ref_key_str in refs:
             to_fetch.append((ref_key_str, refs[ref_key_str], cache_key))
         else:
@@ -579,8 +612,8 @@ def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
                 try:
                     content = future.result()
                     results[ref_key_str] = content
-                    # Cache it
-                    _source_cache[cache_key] = content
+                    # Cache it with timestamp for TTL
+                    _source_cache[cache_key] = (now, content)
                 except Exception:
                     results[ref_key_str] = None
 
