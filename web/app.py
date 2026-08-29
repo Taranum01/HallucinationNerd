@@ -20,6 +20,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# The canonical verification engine lives in the repository ROOT
+# (verify_hallucinations.py), while web/ holds a thin re-export shim. When the
+# app is started from web/ (Render Root Directory = web), the root must be on
+# sys.path FIRST so `import verify_hallucinations` resolves to the real engine
+# rather than the shim shadowing it. Insert it ahead of the web/ directory.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 # The verification engine files (verify_hallucinations.py, arxiv_extractor.py)
 # are co-located in this directory for deployment.
 

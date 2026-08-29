@@ -10,3 +10,7 @@ Phase 3 of the code-review plan: the previous fork at this path diverged
 in the root; this file is a thin re-export.
 """
 from verify_hallucinations import *  # noqa: F401,F403
+
+# `import *` skips underscore-prefixed names, but the web app imports these
+# private helpers explicitly, so re-export them so uploads don't fail.
+from verify_hallucinations import _parse_pdf, _find_relevant_spans  # noqa: F401
