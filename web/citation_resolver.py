@@ -15,6 +15,7 @@ import os
 import time
 import hashlib
 import requests
+import threading
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -40,6 +41,52 @@ def _rate_limit():
     if elapsed < _MIN_REQUEST_INTERVAL:
         time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
     _last_request_time = time.time()
+
+
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_DEFAULT_REQUEST_ATTEMPTS = 2  # initial request + one backoff retry
+_PATIENT_REQUEST_ATTEMPTS = 11  # initial request + up to ten backoff retries
+_MAX_RETRY_DELAY_SECONDS = 5.0
+_request_policy = threading.local()
+
+
+def _retry_delay(response, attempt: int) -> float:
+    """Return a bounded Retry-After delay or an exponential fallback."""
+    retry_after = ""
+    if response is not None:
+        retry_after = (getattr(response, "headers", {}) or {}).get("Retry-After", "")
+    try:
+        delay = float(retry_after)
+    except (TypeError, ValueError):
+        delay = 0.6 * (2 ** attempt)
+    return min(max(delay, 0.0), _MAX_RETRY_DELAY_SECONDS)
+
+
+def _get_with_backoff(url: str, **kwargs):
+    """GET with the active bounded retry policy.
+
+    Normal verification makes one backoff retry. A user who chooses "I can
+    wait" gets up to ten backoff retries. The policy is thread-local because
+    citation downloads run in a worker pool.
+    """
+    response = None
+    attempts = getattr(_request_policy, "attempts", _DEFAULT_REQUEST_ATTEMPTS)
+    for attempt in range(attempts):
+        _rate_limit()
+        try:
+            response = requests.get(url, **kwargs)
+        except requests.RequestException:
+            response = None
+
+        status = getattr(response, "status_code", None)
+        if response is not None and status not in _RETRYABLE_STATUS_CODES:
+            _request_policy.throttled = False
+            return response
+        if attempt + 1 < attempts:
+            _time.sleep(_retry_delay(response, attempt))
+    if getattr(response, "status_code", None) == 429:
+        _request_policy.throttled = True
+    return response
 
 
 def resolve_references(full_text: str) -> dict:
@@ -505,24 +552,15 @@ def fetch_source_content(ref_info: dict, max_chars: int = 15000) -> Optional[str
 
 def _fetch_arxiv(arxiv_id: str) -> Optional[str]:
     """Fetch full text of an arXiv paper by downloading its PDF."""
-    _rate_limit()
     try:
         import tempfile
         # Download the actual PDF (open access)
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
-        # Retry with backoff: arXiv rate-limits (429) and occasionally 5xxs;
-        # a single miss should not silently drop the source.
-        resp = None
-        for _attempt in range(2):
-            try:
-                resp = requests.get(pdf_url, timeout=30, headers={"User-Agent": "HallucinationNerd/1.0"})
-            except requests.RequestException:
-                resp = None
-            if resp is not None and resp.status_code == 200:
-                break
-            if resp is not None and resp.status_code not in (429, 500, 502, 503, 504):
-                break
-            _time.sleep(0.6 * (_attempt + 1))
+        resp = _get_with_backoff(
+            pdf_url,
+            timeout=30,
+            headers={"User-Agent": "HallucinationNerd/1.0"},
+        )
         if resp is not None and resp.status_code == 200 and resp.headers.get("content-type", "").startswith("application/pdf"):
             # Save to temp file and extract text
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -543,8 +581,8 @@ def _fetch_arxiv(arxiv_id: str) -> Optional[str]:
 
         # Fallback: get abstract from HTML page
         abs_url = f"https://arxiv.org/abs/{arxiv_id}"
-        resp = requests.get(abs_url, timeout=15, headers={"User-Agent": "HallucinationNerd/1.0"})
-        if resp.status_code == 200:
+        resp = _get_with_backoff(abs_url, timeout=15, headers={"User-Agent": "HallucinationNerd/1.0"})
+        if resp is not None and resp.status_code == 200:
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "html.parser")
             abstract_block = soup.find("blockquote", class_="abstract")
@@ -561,11 +599,10 @@ def _fetch_arxiv(arxiv_id: str) -> Optional[str]:
 def _fetch_doi(doi: str) -> Optional[str]:
     """Resolve a DOI — try Unpaywall for free PDF first, then landing page."""
     # Try Unpaywall first (finds free/open-access versions)
-    _rate_limit()
     try:
         unpaywall_url = f"https://api.unpaywall.org/v2/{doi}?email={os.getenv('UNPAYWALL_EMAIL', 'hallucinationnerd@example.com')}"
-        resp = requests.get(unpaywall_url, timeout=10)
-        if resp.status_code == 200:
+        resp = _get_with_backoff(unpaywall_url, timeout=10)
+        if resp is not None and resp.status_code == 200:
             data = resp.json()
             # Look for a free PDF URL
             best_oa = data.get("best_oa_location", {})
@@ -587,12 +624,11 @@ def _fetch_doi(doi: str) -> Optional[str]:
         pass
 
     # Fallback: resolve DOI to landing page and scrape
-    _rate_limit()
     try:
         url = f"https://doi.org/{doi}"
-        resp = requests.get(url, timeout=15, allow_redirects=True,
+        resp = _get_with_backoff(url, timeout=15, allow_redirects=True,
                           headers={"User-Agent": "HallucinationNerd/1.0", "Accept": "text/html"})
-        if resp.status_code == 200 and len(resp.text) > 500:
+        if resp is not None and resp.status_code == 200 and len(resp.text) > 500:
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "html.parser")
             for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
@@ -607,11 +643,10 @@ def _fetch_doi(doi: str) -> Optional[str]:
 
 def _fetch_pdf_from_url(url: str) -> Optional[str]:
     """Download a PDF from a URL and extract text."""
-    _rate_limit()
     try:
         import tempfile
-        resp = requests.get(url, timeout=30, headers={"User-Agent": "HallucinationNerd/1.0"})
-        if resp.status_code == 200 and len(resp.content) > 1000:
+        resp = _get_with_backoff(url, timeout=30, headers={"User-Agent": "HallucinationNerd/1.0"})
+        if resp is not None and resp.status_code == 200 and len(resp.content) > 1000:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(resp.content)
                 tmp_path = tmp.name
@@ -634,11 +669,10 @@ def _fetch_pdf_from_url(url: str) -> Optional[str]:
 
 def _fetch_url_safe(url: str) -> Optional[str]:
     """Fetch a URL and extract text content."""
-    _rate_limit()
     try:
-        resp = requests.get(url, timeout=15, allow_redirects=True,
+        resp = _get_with_backoff(url, timeout=15, allow_redirects=True,
                           headers={"User-Agent": "HallucinationNerd/1.0"})
-        if resp.status_code == 200 and len(resp.text) > 200:
+        if resp is not None and resp.status_code == 200 and len(resp.text) > 200:
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "html.parser")
             for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
@@ -653,11 +687,10 @@ def _fetch_url_safe(url: str) -> Optional[str]:
 
 def _fetch_pubmed_abstract(pmid: str) -> Optional[str]:
     """Fetch a PubMed abstract by PMID."""
-    _rate_limit()
     try:
         url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={pmid}&rettype=abstract&retmode=text"
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 200 and len(resp.text) > 50:
+        resp = _get_with_backoff(url, timeout=15)
+        if resp is not None and resp.status_code == 200 and len(resp.text) > 50:
             return resp.text
     except Exception:
         pass
@@ -683,12 +716,11 @@ def _search_and_fetch(query: str) -> Optional[str]:
         return result
 
     # Fall back to PubMed (biomedical)
-    _rate_limit()
     try:
         search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
         params = {"db": "pubmed", "term": query, "retmax": 1, "retmode": "json"}
-        resp = requests.get(search_url, params=params, timeout=10)
-        if resp.status_code != 200:
+        resp = _get_with_backoff(search_url, params=params, timeout=10)
+        if resp is None or resp.status_code != 200:
             return None
 
         data = resp.json()
@@ -716,11 +748,10 @@ def _pubmed_title(pmid: str) -> str:
     Returns "" when the lookup fails; callers fail open in that case so a
     transient esummary hiccup does not cost a legitimately matched abstract.
     """
-    _rate_limit()
     try:
         url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-        resp = requests.get(url, params={"db": "pubmed", "id": pmid, "retmode": "json"}, timeout=10)
-        if resp.status_code == 200:
+        resp = _get_with_backoff(url, params={"db": "pubmed", "id": pmid, "retmode": "json"}, timeout=10)
+        if resp is not None and resp.status_code == 200:
             doc = resp.json().get("result", {}).get(str(pmid), {}) or {}
             return doc.get("title", "") or ""
     except Exception:
@@ -753,16 +784,7 @@ def _search_arxiv_by_title(query: str) -> Optional[str]:
         # arXiv API search (https avoids the http->https redirect round-trip)
         clean_query = re.sub(r'[^\w\s]', ' ', query).strip()
         search_url = f"https://export.arxiv.org/api/query?search_query=ti:{urllib.parse.quote(clean_query[:100])}&max_results=1"
-        resp = None
-        for _attempt in range(2):
-            _rate_limit()
-            try:
-                resp = requests.get(search_url, timeout=20)
-            except requests.RequestException:
-                resp = None
-            if resp is not None and resp.status_code == 200:
-                break
-            _time.sleep(0.6 * (_attempt + 1))
+        resp = _get_with_backoff(search_url, timeout=20)
         if resp is None or resp.status_code != 200:
             return None
 
@@ -814,15 +836,14 @@ def _search_openalex(query: str) -> Optional[str]:
     responsive when both rate-limit us. Same relevance standard as the other
     legs: the title guard applies before any fetch.
     """
-    _rate_limit()
     try:
-        resp = requests.get(
+        resp = _get_with_backoff(
             "https://api.openalex.org/works",
             params={"search": query[:120], "per-page": 5},
             headers={"User-Agent": "HallucinationNerd/1.0 (citation verification)"},
             timeout=12,
         )
-        if resp.status_code != 200:
+        if resp is None or resp.status_code != 200:
             return None
         for work in resp.json().get("results", []) or []:
             cand_title = str(work.get("display_name", "") or "")
@@ -844,15 +865,14 @@ def _search_openalex(query: str) -> Optional[str]:
 
 def _search_semantic_scholar(query: str) -> Optional[str]:
     """Search Semantic Scholar API for a paper and return its full text if on arXiv, otherwise title + abstract."""
-    _rate_limit()
     try:
         url = "https://api.semanticscholar.org/graph/v1/paper/search"
         params = {"query": query[:200], "limit": 1, "fields": "title,abstract,externalIds"}
         headers = {"User-Agent": "HallucinationNerd/1.0"}
         if _S2_API_KEY:
             headers["x-api-key"] = _S2_API_KEY
-        resp = requests.get(url, params=params, timeout=15, headers=headers)
-        if resp.status_code != 200:
+        resp = _get_with_backoff(url, params=params, timeout=15, headers=headers)
+        if resp is None or resp.status_code != 200:
             return None
 
         data = resp.json()
@@ -916,12 +936,11 @@ def _make_cache_key(ref_info: dict, ref_key: str) -> str:
 
 def _search_pubmed(query: str) -> Optional[str]:
     """Search PubMed by query and return the top hit's abstract (backup search)."""
-    _rate_limit()
     try:
         search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
         params = {"db": "pubmed", "term": query, "retmax": 1, "retmode": "json"}
-        resp = requests.get(search_url, params=params, timeout=10)
-        if resp.status_code != 200:
+        resp = _get_with_backoff(search_url, params=params, timeout=10)
+        if resp is None or resp.status_code != 200:
             return None
         ids = resp.json().get("esearchresult", {}).get("idlist", [])
         if not ids:
@@ -974,7 +993,22 @@ def backup_search(query: str, databases: list, custom_url_template: str = ""):
     return None, None
 
 
-def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
+class ResolutionResult(dict):
+    """Resolved-source mapping with refs still throttled after retries."""
+
+    def __init__(self, *args, throttled_refs=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.throttled_refs = throttled_refs or []
+
+
+def _fetch_with_policy(ref_info: dict, patient: bool):
+    _request_policy.attempts = _PATIENT_REQUEST_ATTEMPTS if patient else _DEFAULT_REQUEST_ATTEMPTS
+    _request_policy.throttled = False
+    content = fetch_source_content(ref_info)
+    return content, (not content and bool(getattr(_request_policy, "throttled", False)))
+
+
+def resolve_and_fetch_all(full_text: str, cited_refs: list, patient: bool = False) -> dict:
     """
     Main entry point: given full document text and a list of citation markers
     (e.g., ["1", "2"]), resolve each to actual content.
@@ -1021,18 +1055,21 @@ def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
             results[ref_key_str] = None
 
     # Parallel fetch (5 workers — fast but polite)
+    throttled_refs = []
     if to_fetch:
         with ThreadPoolExecutor(max_workers=5) as executor:
             future_to_ref = {}
             for ref_key_str, ref_info, cache_key in to_fetch:
-                future = executor.submit(fetch_source_content, ref_info)
+                future = executor.submit(_fetch_with_policy, ref_info, patient)
                 future_to_ref[future] = (ref_key_str, cache_key)
 
             for future in as_completed(future_to_ref):
                 ref_key_str, cache_key = future_to_ref[future]
                 try:
-                    content = future.result()
+                    content, throttled = future.result()
                     results[ref_key_str] = content
+                    if throttled:
+                        throttled_refs.append(ref_key_str)
                     # Cache ONLY successful fetches. Caching None poisons the
                     # cache: a single transient failure (e.g. arXiv rate-limit)
                     # would otherwise stick for the whole TTL and never retry.
@@ -1041,4 +1078,4 @@ def resolve_and_fetch_all(full_text: str, cited_refs: list) -> dict:
                 except Exception:
                     results[ref_key_str] = None
 
-    return results
+    return ResolutionResult(results, throttled_refs=throttled_refs)
