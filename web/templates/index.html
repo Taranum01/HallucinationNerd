@@ -111,6 +111,7 @@
                 <div class="motif" aria-hidden="true">[ <b>&#10003;</b> ]</div>
                 <p class="title">Ready for analysis</p>
                 <p class="sub">Upload a document on the left. Each claim is checked against the source its citation points to.</p>
+                <button type="button" id="tryDemoBtn" class="review-btn demo-btn">Explore a sample report</button>
             </div>
 
             <!-- Loading state -->
@@ -157,6 +158,18 @@
                     </details>
 
                 </div>
+            </div>
+
+            <div id="sampleNotice" class="sample-notice hidden" role="status">Sample report - illustrative results, not a live verification. Upload your own document to run an analysis.</div>
+            <div id="reviewTools" class="review-tools hidden">
+                <div class="review-actions">
+                    <button type="button" id="fixFirstBtn" class="review-btn" aria-pressed="false">Fix-first view</button>
+                    <button type="button" id="originalOrderBtn" class="review-btn" aria-pressed="true">Document order</button>
+                    <button type="button" id="exportReportBtn" class="review-btn">Download private HTML report</button>
+                </div>
+                <p class="review-hint">Download stays on this device, but the file contains document claims and evidence. Share it only if intended.</p>
+                <p id="reviewHint" class="review-hint">Document order shows claims as they appeared in the input.</p>
+                <details id="sourceMapPanel" class="source-map-panel"><summary>Source map <span id="sourceMapCount"></span></summary><div id="sourceMapGroups"></div></details>
             </div>
 
             <!-- Detailed claims -->
