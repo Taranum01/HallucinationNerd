@@ -312,6 +312,7 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
     # Resolve all citations at once (fetches from arXiv, DOI, PubMed, URLs)
     # Use FULL text here (not trimmed) since References section is at the end
     resolved_sources = {}
+    parsed_refs = {}
     parsed_ref_keys = set()
     if all_cited:
         if patient_wait:
@@ -323,7 +324,8 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
         # one that is in the bibliography but whose content couldn't be fetched
         # ("could not access").
         try:
-            parsed_ref_keys = {str(k) for k in resolve_references(text).keys()}
+            parsed_refs = resolve_references(text)
+            parsed_ref_keys = {str(k) for k in parsed_refs}
         except Exception:
             parsed_ref_keys = set()
     # For numbered bibliographies, the largest real reference number bounds what
@@ -544,6 +546,14 @@ def _run_verification(file_path: str, filename: str, suffix: str, source_type: s
             "precision_percent_full": round(precision_pct, 6),
         },
         "claims": results,
+        "source_map": {
+            str(key): {
+                "title": str(parsed_refs.get(str(key), {}).get("title") or "")[:300],
+                "url": str(parsed_refs.get(str(key), {}).get("url") or "")[:600],
+                "doi": str(parsed_refs.get(str(key), {}).get("doi") or "")[:200],
+            }
+            for key in sorted(all_cited, key=str)
+        },
         "retry_offer": bool(getattr(resolved_sources, "throttled_refs", [])) and not patient_wait,
         "throttled_refs": list(getattr(resolved_sources, "throttled_refs", [])),
     }

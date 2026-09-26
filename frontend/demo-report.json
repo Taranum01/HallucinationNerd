@@ -1,0 +1,87 @@
+{
+  "filename": "sample-check.txt (illustrative)",
+  "summary": {
+    "total_claims": 5,
+    "supported": 1,
+    "partially_supported": 0,
+    "not_supported": 1,
+    "contradicted": 1,
+    "citation_not_found": 1,
+    "inaccessible": 1,
+    "unverifiable": 0
+  },
+  "source_map": {
+    "1": {
+      "title": "Sample Study on Sleep",
+      "url": "",
+      "doi": ""
+    },
+    "2": {
+      "title": "Sample Review on Caffeine",
+      "url": "",
+      "doi": ""
+    },
+    "3": {
+      "title": "",
+      "url": "",
+      "doi": ""
+    },
+    "4": {
+      "title": "Sample Trial on Activity",
+      "url": "",
+      "doi": ""
+    }
+  },
+  "claims": [
+    {
+      "claim": "A sample study reports that sleep duration affected reaction time [1].",
+      "cited_refs": [
+        "1"
+      ],
+      "verdict": "SUPPORTED",
+      "confidence": 0.88,
+      "evidence_quote": "Illustrative evidence quote: reaction time varied with sleep duration.",
+      "reasoning": "This is a demonstration verdict, not a research finding."
+    },
+    {
+      "claim": "A sample review found that caffeine has no effect on sleep [2].",
+      "cited_refs": [
+        "2"
+      ],
+      "verdict": "CONTRADICTED",
+      "confidence": 0.75,
+      "evidence_quote": "Illustrative evidence quote: caffeine intake was associated with shorter sleep.",
+      "reasoning": "The sample quote points in the opposite direction."
+    },
+    {
+      "claim": "An activity trial confirms a precise 50% improvement for every participant [4].",
+      "cited_refs": [
+        "4"
+      ],
+      "verdict": "NOT_SUPPORTED",
+      "confidence": 0.69,
+      "evidence_quote": "Illustrative evidence quote: outcomes varied among participants.",
+      "reasoning": "The invented sample source does not support the precise universal claim."
+    },
+    {
+      "claim": "The sample cites an unlisted source for a general health claim [3].",
+      "cited_refs": [
+        "3"
+      ],
+      "verdict": "CITATION_NOT_FOUND",
+      "confidence": 0,
+      "evidence_quote": "",
+      "reasoning": "Reference [3] is not present in the illustrative bibliography."
+    },
+    {
+      "claim": "A fourth source contains an inaccessible result [4].",
+      "cited_refs": [
+        "4"
+      ],
+      "verdict": "INACCESSIBLE",
+      "confidence": 0,
+      "evidence_quote": "",
+      "reasoning": "The illustrative source cannot be checked."
+    }
+  ]
+}
