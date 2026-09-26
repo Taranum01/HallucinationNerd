@@ -156,7 +156,9 @@ function renderResults(data) {
         const card = document.createElement('div');
         card.className = `claim-card fade-in ${getVerdictClass(claim.verdict)}`;
         card.dataset.cat = categoryOf(claim.verdict);
-        card.style.animationDelay = `${i * 0.05}s`;
+        // Bound the entrance sequence on long reports.
+        if (i < 8) card.style.animationDelay = `${i * 0.045}s`;
+        else card.classList.remove('fade-in');
 
         const noRefs = (!claim.cited_refs || claim.cited_refs.length === 0);
         let verdictBadge;
