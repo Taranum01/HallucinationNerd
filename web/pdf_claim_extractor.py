@@ -108,6 +108,84 @@ def extract_uncited_claims_from_text(text: str, max_claims: int = 25) -> List[di
     return claims
 
 
+_SPLIT_BLOCKERS = re.compile(
+    r"\b(but|unlike|while|whereas|however|although|though|which|that|who|whose|not|no|nor|"
+    r"neither|except|despite|versus|vs|whereby|because|since|if|than|both)\b", re.I)
+_SPLIT_PREPS = re.compile(
+    r"\b(in|for|on|to|with|of|by|from|at|as|over|under|after|before|between|through|"
+    r"into|about|against|during|via|using|across)\b", re.I)
+
+
+def _split_per_item_citations(clean: str):
+    """Split a sentence that gives a SEPARATE single reference to each list item into one
+    claim per (item, citation) pair: "<lead-in> <item> [n]."
+
+    Deliberately conservative. The sentence is split only when it is exactly
+        <lead-in> [introducer] <item> [n] (, | and | or | , and ...) <item> [n] ... [.]
+    with nothing after the last citation, no contrast/negation/relative-clause words, and
+    short noun-phrase-like items. Anything else (trailing predicate, contrast, negation,
+    clauses, joint "[1, 2]" or range "[1-3]" markers) is returned unchanged (None) so the
+    claim text and citation association are never altered. The list introducer ("such as",
+    "including", ...) stays in the lead-in.
+
+    Returns a list of (claim_text, [ref_num]) pairs, or None.
+    """
+    single = re.compile(r'\[\s*(\d{1,3})\s*\]')
+    if len(single.findall(clean)) < 2:
+        return None
+    # any other bracketed citation form (joint, range, mixed, adjacent "[1], [2]") -> keep whole
+    if re.search(r'\[[^\]]*\]', single.sub('', clean)):
+        return None
+    if re.search(r'\[\s*\d{1,3}\s*\]\s*,?\s*\[', clean):
+        return None
+    last_end = [m.end() for m in single.finditer(clean)][-1]
+    if clean[last_end:].strip(' .;!?') != '':
+        return None  # text after the last citation: shared predicate/other meaning, keep whole
+    first = single.search(clean).start()
+    head = clean[:first]
+    intro = re.search(r'\b(such as|including|namely|like)\b|:', head, flags=re.I)
+    if intro:
+        lead_in = clean[:intro.end()].strip().rstrip(',;')
+        list_region = clean[intro.end():]
+        if _SPLIT_BLOCKERS.search(lead_in):
+            return None
+        first_item_ok_preps = True
+    else:
+        prep = None
+        for m in re.finditer(r'\b(in|for|on|to|with)\b', head, flags=re.I):
+            prep = m
+        if not prep:
+            return None
+        lead_in = clean[:prep.end()].strip().rstrip(',;:')
+        list_region = clean[prep.end():]
+        if _SPLIT_BLOCKERS.search(lead_in) or ',' in lead_in:
+            return None
+        first_item_ok_preps = False
+    if len(lead_in) < 3 or len(lead_in.split()) < 2:
+        return None
+
+    pieces, prev = [], 0
+    for m in single.finditer(list_region):
+        pieces.append((list_region[prev:m.start()], int(m.group(1))))
+        prev = m.end()
+    if len(pieces) < 2:
+        return None
+
+    out = []
+    for i, (txt, num) in enumerate(pieces):
+        item = re.sub(r'^[\s,;]*(?:(?:and|or)\b)?\s*', '', txt, flags=re.I).strip(' ,;.')
+        if not item or len(item.split()) > 7:
+            return None
+        if _SPLIT_BLOCKERS.search(item) or re.search(r'[;:()]', item):
+            return None
+        if (i > 0 or not intro or not first_item_ok_preps) and _SPLIT_PREPS.search(item):
+            return None
+        if i > 0 and ',' in item.strip():
+            return None
+        out.append((f"{lead_in} {item} [{num}].", num))
+    return out
+
+
 def extract_cited_claims_from_text(text: str, max_claims: int = 200) -> List[dict]:
     """
     Extract sentences/clauses containing citation markers [N] from document text.
@@ -210,6 +288,24 @@ def extract_cited_claims_from_text(text: str, max_claims: int = 200) -> List[dic
         if key in seen:
             continue
         seen.add(key)
+
+        # If this sentence attributes a separate reference to each list item
+        # ("X [1], Y [2], and Z [3]"), split it into one claim per (item, citation) pair so
+        # each reference is checked only against its own item -- not the whole list. A single
+        # citation or a joint "[1, 2]" is left as one claim.
+        split = _split_per_item_citations(clean)
+        if split:
+            for clause_text, num in split:
+                k2 = ("split", clause_text)
+                if k2 in seen:
+                    continue
+                seen.add(k2)
+                claims.append({"claim_text": clause_text, "cited_refs": [num]})
+                if len(claims) >= max_claims:
+                    break
+            if len(claims) >= max_claims:
+                break
+            continue
 
         claims.append({
             "claim_text": clean,
